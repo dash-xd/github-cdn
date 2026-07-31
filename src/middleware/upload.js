@@ -99,7 +99,7 @@ function parseUpload(req, res, next) {
             });
         }
 
-        req.files = files;
+        res.locals.files = files;
 
         req.body = {
             ...req.body,
