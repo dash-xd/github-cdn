@@ -15,18 +15,14 @@ const {
     handleError
 } = require("./src/middleware/github-repos.js");
 
-// One Octokit instance per token, reused for the lifetime of this warm
-// function instance instead of being rebuilt on every request.
-const octokitByToken = new Map();
+const octokits = new Map();
 
 function lazyCreateOctokit(token) {
-    let octokit = octokitByToken.get(token);
-
+    let octokit = octokits.get(token);
     if (!octokit) {
         octokit = createOctokit(token);
-        octokitByToken.set(token, octokit);
+        octokits.set(token, octokit);
     }
-
     return octokit;
 }
 
