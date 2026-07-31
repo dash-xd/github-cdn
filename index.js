@@ -2,6 +2,7 @@
 
 const { SimpleRouterBuilder, NewEmptyRouter } = require("simple-router-builder");
 
+const { createOctokit } = require("./src/lib/client.js");
 const { githubAuth } = require("./src/middleware/github-auth.js");
 const { parseUpload } = require("./src/middleware/upload.js");
 const {
@@ -14,8 +15,23 @@ const {
     handleError
 } = require("./src/middleware/github-repos.js");
 
+// One Octokit instance per token, reused for the lifetime of this warm
+// function instance instead of being rebuilt on every request.
+const octokitByToken = new Map();
+
+function lazyCreateOctokit(token) {
+    let octokit = octokitByToken.get(token);
+
+    if (!octokit) {
+        octokit = createOctokit(token);
+        octokitByToken.set(token, octokit);
+    }
+
+    return octokit;
+}
+
 const githubRouter = NewEmptyRouter()
-    .use(githubAuth)
+    .use(githubAuth(lazyCreateOctokit))
     .post("/repos/:name", createRepoHandler)
     .post("/repos/:owner/:repo/upload", parseUpload, uploadObjectsHandler)
     .get("/repos/:owner/:repo/:branch", getBranchSnapshotHandler)
