@@ -3,7 +3,7 @@
 const express = require("express");
 
 const { githubAuth } = require("../middleware/github-auth.js");
-const { parseUpload } = require("../middleware/upload.js");
+const { parseUpload, objectPath } = require("../middleware/upload.js");
 const {
     createRepo,
     commitFiles,
@@ -34,14 +34,21 @@ router.post("/repos/:name", async (req, res, next) => {
     }
 });
 
-// Upload one or more files (multipart/form-data), returns the repo name.
+// Upload one or more files (multipart/form-data) as content-addressed
+// objects. Returns each object's id, storage path, and original
+// filename/content-type as informational metadata.
 router.post("/repos/:owner/:repo/upload", parseUpload, async (req, res, next) => {
     try {
         const branch = req.query.branch || req.body.branch;
 
         const result = await commitFiles(req.octokit, req.params.owner, req.params.repo, branch, req.files);
 
-        res.json({ repo: req.params.repo, branch: result.branch, commit: result.commit });
+        res.json({
+            repo: req.params.repo,
+            branch: result.branch,
+            commit: result.commit,
+            objects: result.objects
+        });
     } catch (err) {
         next(err);
     }
@@ -66,13 +73,23 @@ router.get("/repos/:owner/:repo/:branch", async (req, res, next) => {
     }
 });
 
-// Delete a file or list of files given path(s).
+// Delete a file or list of files. Accepts raw tree paths ('path'/'paths')
+// or content-addressed object ids ('objectId'/'objectIds') - object ids
+// are resolved to their storage path the same way upload.js picks it.
 router.delete("/repos/:owner/:repo/:branch", async (req, res, next) => {
     try {
-        const paths = Array.isArray(req.body.paths) ? req.body.paths : [req.body.path].filter(Boolean);
+        const explicitPaths = Array.isArray(req.body.paths) ? req.body.paths : [req.body.path].filter(Boolean);
+
+        const objectIds = Array.isArray(req.body.objectIds)
+            ? req.body.objectIds
+            : [req.body.objectId].filter(Boolean);
+
+        const paths = [...explicitPaths, ...objectIds.map(objectPath)];
 
         if (paths.length === 0) {
-            return res.status(400).json({ error: "provide 'path' or 'paths' in the request body" });
+            return res.status(400).json({
+                error: "provide 'path'/'paths' or 'objectId'/'objectIds' in the request body"
+            });
         }
 
         const result = await deleteFiles(req.octokit, req.params.owner, req.params.repo, req.params.branch, paths);
