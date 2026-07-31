@@ -15,6 +15,25 @@ index.js (Main, SimpleRouterBuilder)
         └── repo-service.js                                  GitHub service layer (git.createBlob/createTree/createCommit/updateRef, etc.)
 ```
 
+`index.js` is the entire Cloud Function entry point:
+
+```js
+exports.Main = new SimpleRouterBuilder()
+    .withChildRouter("/github", githubRouter)
+    .withChildRouter("/healthz", healthRouter)
+    .withRootHandler((req, res) => {
+        res.statusCode = 404;
+        res.end("Not found");
+    })
+    .build();
+```
+
+`@google-cloud/functions-framework` (run via `npx`, see below) wraps this in
+its own Express app, so by the time `Main(req, res)` is invoked, `req`/`res`
+already carry the full Express prototype (`res.json`, `res.status`, etc.) —
+the child routers just need to be ordinary `express.Router()` instances, no
+extra wrapping required.
+
 Auth is per-request and stateless: each call must send `Authorization: Bearer <github token>`.
 No token is stored on the server.
 
@@ -63,5 +82,7 @@ POST /github/repos/user/my-app-a82f91cd/branches/from
 
 ## Notes
 
-- `simple-router-builder` mirrors the pattern used in the `haram-abi` repo; point npm at whatever registry that package is published to if it isn't on the public npm registry in your environment.
+- `simple-router-builder` isn't published to the npm registry, so `package.json`
+  pulls it directly from source: `"simple-router-builder": "github:dash-xd/simple-router-builder#main"`.
+  `npm install` needs read access to that repo.
 - `@octokit/rest` is pinned to `^20` because `^21` and later are ESM-only and this project uses CommonJS (`require`), matching the Cloud Functions entry point convention.
