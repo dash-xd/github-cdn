@@ -1,6 +1,6 @@
 "use strict";
 
-const { createOctokit } = require("../github/client.js");
+const { createOctokit } = require("../lib/client.js");
 
 function githubAuth(req, res, next) {
     const header = req.headers.authorization || "";
