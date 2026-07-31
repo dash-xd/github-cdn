@@ -1,34 +1,38 @@
 "use strict";
 
+const crypto = require("node:crypto");
 const Busboy = require("busboy");
 
-// GitHub's blob creation API caps content around 100MB, but keep uploads
+// GitHub blob creation API caps content around 100MB, but keep uploads
 // modest since blobs are base64-encoded and buffered in memory here.
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
-// Filenames become git blob paths, so nested paths (e.g. "src/index.js")
-// must survive busboy's default basename-only behavior, and anything that
-// could escape the repo tree (leading "/", "..", drive letters) is rejected.
-function isSafeRelativePath(filePath) {
-    if (!filePath) return false;
-    const normalized = filePath.replace(/\\/g, "/");
-    if (normalized.startsWith("/") || /^[a-zA-Z]:/.test(normalized)) return false;
-    const segments = normalized.split("/");
-    return segments.every((segment) => segment !== "" && segment !== "." && segment !== "..");
+function objectPath(hash) {
+    return `objects/${hash.slice(0, 2)}/${hash}`;
 }
 
 function parseUpload(req, res, next) {
     const contentType = req.headers["content-type"] || "";
 
     if (!contentType.startsWith("multipart/form-data")) {
-        return res.status(400).json({ error: "expected multipart/form-data" });
+        return res.status(400).json({
+            error: "expected multipart/form-data"
+        });
     }
 
     let busboy;
+
     try {
-        busboy = Busboy({ headers: req.headers, limits: { fileSize: MAX_FILE_BYTES }, preservePath: true });
+        busboy = Busboy({
+            headers: req.headers,
+            limits: {
+                fileSize: MAX_FILE_BYTES
+            }
+        });
     } catch (err) {
-        return res.status(400).json({ error: "invalid multipart payload" });
+        return res.status(400).json({
+            error: "invalid multipart payload"
+        });
     }
 
     const files = [];
@@ -42,29 +46,40 @@ function parseUpload(req, res, next) {
     busboy.on("file", (fieldName, stream, info) => {
         const chunks = [];
 
-        if (!isSafeRelativePath(info.filename)) {
-            failed = true;
-            res.status(400).json({ error: `invalid file path: ${info.filename}` });
-            stream.resume();
-            req.unpipe(busboy);
-            return;
-        }
-
-        stream.on("data", (chunk) => chunks.push(chunk));
+        stream.on("data", (chunk) => {
+            chunks.push(chunk);
+        });
 
         stream.on("limit", () => {
             failed = true;
-            res.status(413).json({ error: `file exceeds ${MAX_FILE_BYTES} bytes: ${info.filename}` });
+
+            res.status(413).json({
+                error: `file exceeds ${MAX_FILE_BYTES} bytes`
+            });
+
             req.unpipe(busboy);
         });
 
         stream.on("end", () => {
-            if (!failed) {
-                files.push({
-                    path: info.filename,
-                    content: Buffer.concat(chunks)
-                });
+            if (failed) {
+                return;
             }
+
+            const content = Buffer.concat(chunks);
+
+            const objectId = crypto
+                .createHash("sha256")
+                .update(content)
+                .digest("hex");
+
+            files.push({
+                objectId,
+                path: objectPath(objectId),
+                originalName: info.filename,
+                contentType: info.mimeType,
+                size: content.length,
+                content
+            });
         });
     });
 
@@ -74,18 +89,30 @@ function parseUpload(req, res, next) {
     });
 
     busboy.on("finish", () => {
-        if (failed) return;
+        if (failed) {
+            return;
+        }
 
         if (files.length === 0) {
-            return res.status(400).json({ error: "no files uploaded" });
+            return res.status(400).json({
+                error: "no files uploaded"
+            });
         }
 
         req.files = files;
-        req.body = { ...req.body, ...fields };
+
+        req.body = {
+            ...req.body,
+            ...fields
+        };
+
         next();
     });
 
     req.pipe(busboy);
 }
 
-module.exports = { parseUpload };
+module.exports = {
+    parseUpload,
+    objectPath
+};
