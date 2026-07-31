@@ -1,6 +1,6 @@
 "use strict";
 
-const express = require("express");
+const { NewEmptyRouter } = require("simple-router-builder");
 
 const { githubAuth } = require("../middleware/github-auth.js");
 const { parseUpload, objectPath } = require("../middleware/upload.js");
@@ -13,9 +13,8 @@ const {
     createBranchFrom
 } = require("../github/repo-service.js");
 
-const router = express.Router();
+const router = NewEmptyRouter();
 
-router.use(express.json());
 router.use(githubAuth);
 
 // Create a repo named `<name>-<random>`.
