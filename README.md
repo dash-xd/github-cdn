@@ -28,11 +28,20 @@ exports.Main = new SimpleRouterBuilder()
     .build();
 ```
 
-`@google-cloud/functions-framework` (run via `npx`, see below) wraps this in
-its own Express app, so by the time `Main(req, res)` is invoked, `req`/`res`
-already carry the full Express prototype (`res.json`, `res.status`, etc.) —
-the child routers just need to be ordinary `express.Router()` instances, no
-extra wrapping required.
+`githubRouter` and `healthRouter` are built with `NewEmptyRouter()` from
+`simple-router-builder` — a thin wrapper around the standalone `router`
+package (the same routing engine Express's own `Router` is built on), not
+`express.Router()`. This project has no direct dependency on `express` at
+all.
+
+That still works with `res.json`/`res.status`/`req.query`/`req.body`
+because `@google-cloud/functions-framework` (run via `npx`, see below)
+wraps everything in its own Express app *before* calling `Main` — it parses
+the request body itself (json/urlencoded/raw/text, by content-type) and
+attaches the full Express `req`/`res` prototype ahead of time. So by the
+time a request reaches one of our routers, `req.body` is already populated
+and `res.json` already exists — the routers just need to route, which is
+exactly what `NewEmptyRouter()` gives them.
 
 Auth is per-request and stateless: each call must send `Authorization: Bearer <github token>`.
 No token is stored on the server.
@@ -124,4 +133,8 @@ POST /github/repos/user/my-app-a82f91cd/branches/from
 - `simple-router-builder` isn't published to the npm registry, so `package.json`
   pulls it directly from source: `"simple-router-builder": "github:dash-xd/simple-router-builder#main"`.
   `npm install` needs read access to that repo.
+- Routing uses `simple-router-builder`'s `NewEmptyRouter()` end to end — this
+  project doesn't depend on `express` at all. `req.body`/`req.query`/`res.json`
+  still work because `@google-cloud/functions-framework` supplies them via its
+  own internal Express app before `Main` is ever invoked.
 - `@octokit/rest` is pinned to `^20` because `^21` and later are ESM-only and this project uses CommonJS (`require`), matching the Cloud Functions entry point convention.
