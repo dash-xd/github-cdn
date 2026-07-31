@@ -13,7 +13,7 @@ const {
 // Create a repo named `<name>-<random>`.
 async function createRepoHandler(req, res, next) {
     try {
-        const repo = await createRepo(req.octokit, req.params.name, req.body || {});
+        const repo = await createRepo(res.locals.octokit, req.params.name, req.body || {});
 
         res.status(201).json({
             name: repo.name,
@@ -33,7 +33,7 @@ async function uploadObjectsHandler(req, res, next) {
     try {
         const branch = req.query.branch || req.body.branch;
 
-        const result = await commitFiles(req.octokit, req.params.owner, req.params.repo, branch, req.files);
+        const result = await commitFiles(res.locals.octokit, req.params.owner, req.params.repo, branch, res.locals.files);
 
         res.json({
             repo: req.params.repo,
@@ -52,7 +52,7 @@ async function getBranchSnapshotHandler(req, res, next) {
         const includeContent = req.query.content === "true";
 
         const files = await getBranchSnapshot(
-            req.octokit,
+            res.locals.octokit,
             req.params.owner,
             req.params.repo,
             req.params.branch,
@@ -84,7 +84,7 @@ async function deleteObjectsHandler(req, res, next) {
             });
         }
 
-        const result = await deleteFiles(req.octokit, req.params.owner, req.params.repo, req.params.branch, paths);
+        const result = await deleteFiles(res.locals.octokit, req.params.owner, req.params.repo, req.params.branch, paths);
 
         res.json(result);
     } catch (err) {
@@ -99,7 +99,7 @@ async function createEmptyBranchHandler(req, res, next) {
             return res.status(400).json({ error: "'branch' is required" });
         }
 
-        const result = await createEmptyBranch(req.octokit, req.params.owner, req.params.repo, req.body.branch);
+        const result = await createEmptyBranch(res.locals.octokit, req.params.owner, req.params.repo, req.body.branch);
         res.status(201).json(result);
     } catch (err) {
         next(err);
@@ -114,7 +114,7 @@ async function createBranchFromHandler(req, res, next) {
         }
 
         const result = await createBranchFrom(
-            req.octokit,
+            res.locals.octokit,
             req.params.owner,
             req.params.repo,
             req.body.branch,
