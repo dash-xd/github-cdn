@@ -1,0 +1,20 @@
+{
+  "name": "github-cdn",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub-backed content store exposed as an HTTP Cloud Function: create repos, upload files, snapshot branches without cloning, delete files, and manage branches through the GitHub API.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "npx --yes @google-cloud/functions-framework --target=Main",
+    "dev": "npx --yes @google-cloud/functions-framework --target=Main --port=8080"
+  },
+  "dependencies": {
+    "@octokit/rest": "^20.1.2",
+    "busboy": "^1.6.0",
+    "express": "^4.19.2",
+    "simple-router-builder": "^1.0.0"
+  }
+}
