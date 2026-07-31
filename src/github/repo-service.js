@@ -28,6 +28,10 @@ async function getDefaultBranch(octokit, owner, repo) {
     return data.default_branch;
 }
 
+// Writes each uploaded file to its content-addressed path (see
+// middleware/upload.js#objectPath) in a single commit. Storage identity
+// comes from the content hash, not the caller-supplied filename, so
+// re-uploading the same bytes is idempotent: same hash, same path.
 async function commitFiles(octokit, owner, repo, branch, files) {
     if (!files || files.length === 0) {
         throw new Error("no files to upload");
@@ -48,17 +52,26 @@ async function commitFiles(octokit, owner, repo, branch, files) {
         commit_sha: ref.data.object.sha
     });
 
-    const blobs = [];
+    // Several uploaded files can hash to the same object; write each
+    // distinct one once, but still report every requested file below.
+    const uniqueObjects = new Map();
     for (const file of files) {
+        if (!uniqueObjects.has(file.objectId)) {
+            uniqueObjects.set(file.objectId, file);
+        }
+    }
+
+    const blobs = [];
+    for (const object of uniqueObjects.values()) {
         const blob = await octokit.rest.git.createBlob({
             owner,
             repo,
-            content: file.content.toString("base64"),
+            content: object.content.toString("base64"),
             encoding: "base64"
         });
 
         blobs.push({
-            path: file.path,
+            path: object.path,
             mode: "100644",
             type: "blob",
             sha: blob.data.sha
@@ -75,7 +88,7 @@ async function commitFiles(octokit, owner, repo, branch, files) {
     const commit = await octokit.rest.git.createCommit({
         owner,
         repo,
-        message: `upload ${files.length} file${files.length === 1 ? "" : "s"}`,
+        message: `store ${uniqueObjects.size} object${uniqueObjects.size === 1 ? "" : "s"}`,
         tree: tree.data.sha,
         parents: [ref.data.object.sha]
     });
@@ -87,7 +100,18 @@ async function commitFiles(octokit, owner, repo, branch, files) {
         sha: commit.data.sha
     });
 
-    return { repo, branch: targetBranch, commit: commit.data.sha };
+    return {
+        repo,
+        branch: targetBranch,
+        commit: commit.data.sha,
+        objects: files.map((file) => ({
+            objectId: file.objectId,
+            path: file.path,
+            name: file.originalName,
+            contentType: file.contentType,
+            size: file.size
+        }))
+    };
 }
 
 // Snapshot a branch's file tree via the Git Data API instead of `git clone`.
@@ -176,7 +200,7 @@ async function deleteFiles(octokit, owner, repo, branch, paths) {
     const commit = await octokit.rest.git.createCommit({
         owner,
         repo,
-        message: `delete ${paths.length} file${paths.length === 1 ? "" : "s"}`,
+        message: `delete ${paths.length} object${paths.length === 1 ? "" : "s"}`,
         tree: newTree.data.sha,
         parents: [ref.data.object.sha]
     });
