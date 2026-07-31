@@ -26,7 +26,7 @@ const githubRouter = NewEmptyRouter()
 
 function rootHandler(req, res) {
     const path = (req.url || "").split("?")[0];
-    if (req.method === "GET" && path === "/healthz") {
+    if (req.method === "GET") {
         res.statusCode = 200;
         res.setHeader("Content-Type", "application/json");
         res.end(JSON.stringify({ status: "ok" }));
