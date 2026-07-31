@@ -1,8 +1,8 @@
 "use strict";
 
-const express = require("express");
+const { NewEmptyRouter } = require("simple-router-builder");
 
-const router = express.Router();
+const router = NewEmptyRouter();
 
 router.get("/", (req, res) => {
     res.json({ status: "ok" });
