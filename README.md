@@ -13,8 +13,8 @@ src/
     client.js                  createOctokit(token) -> Octokit instance
     repo-service.js            GitHub Git Data API service layer (createRepo, commitFiles, getBranchSnapshot, deleteFiles, createEmptyBranch, createBranchFrom)
   middleware/
-    github-auth.js             githubAuth: builds req.octokit from the request's Bearer token
-    upload.js                  parseUpload: busboy multipart parser + SHA-256 content addressing, plus objectPath()
+    github-auth.js             githubAuth(createOctokit): returns a middleware that builds res.locals.octokit from the request's Bearer token
+    upload.js                  parseUpload: busboy multipart parser + SHA-256 content addressing; writes res.locals.files, plus objectPath()
     github-repos.js            one middleware function per route (createRepoHandler, uploadObjectsHandler, ...) plus handleError
 ```
 
@@ -27,6 +27,7 @@ router module.
 ```js
 const { SimpleRouterBuilder, NewEmptyRouter } = require("simple-router-builder");
 
+const { createOctokit } = require("./src/lib/client.js");
 const { githubAuth } = require("./src/middleware/github-auth.js");
 const { parseUpload } = require("./src/middleware/upload.js");
 const {
@@ -39,16 +40,30 @@ const {
     handleError
 } = require("./src/middleware/github-repos.js");
 
-const githubRouter = NewEmptyRouter();
+// One Octokit instance per token, reused for the lifetime of this warm
+// function instance instead of being rebuilt on every request.
+const octokitByToken = new Map();
 
-githubRouter.use(githubAuth);
-githubRouter.post("/repos/:name", createRepoHandler);
-githubRouter.post("/repos/:owner/:repo/upload", parseUpload, uploadObjectsHandler);
-githubRouter.get("/repos/:owner/:repo/:branch", getBranchSnapshotHandler);
-githubRouter.delete("/repos/:owner/:repo/:branch", deleteObjectsHandler);
-githubRouter.post("/repos/:owner/:repo/branches", createEmptyBranchHandler);
-githubRouter.post("/repos/:owner/:repo/branches/from", createBranchFromHandler);
-githubRouter.use(handleError);
+function lazyCreateOctokit(token) {
+    let octokit = octokitByToken.get(token);
+
+    if (!octokit) {
+        octokit = createOctokit(token);
+        octokitByToken.set(token, octokit);
+    }
+
+    return octokit;
+}
+
+const githubRouter = NewEmptyRouter()
+    .use(githubAuth(lazyCreateOctokit))
+    .post("/repos/:name", createRepoHandler)
+    .post("/repos/:owner/:repo/upload", parseUpload, uploadObjectsHandler)
+    .get("/repos/:owner/:repo/:branch", getBranchSnapshotHandler)
+    .delete("/repos/:owner/:repo/:branch", deleteObjectsHandler)
+    .post("/repos/:owner/:repo/branches", createEmptyBranchHandler)
+    .post("/repos/:owner/:repo/branches/from", createBranchFromHandler)
+    .use(handleError);
 
 function rootHandler(req, res) {
     // GET /healthz -> { status: "ok" }; everything else unmatched -> 404
@@ -65,16 +80,33 @@ exports.Main = new SimpleRouterBuilder()
 engine Express's own `Router` is built on), not `express.Router()`. This
 project has no direct dependency on `express` at all.
 
-That still works with `res.json`/`res.status`/`req.query`/`req.body`
+That still works with `res.json`/`res.status`/`res.locals`/`req.query`/`req.body`
 because `@google-cloud/functions-framework` (run via `npx`, see below)
 wraps everything in its own Express app *before* calling `Main` — it parses
 the request body itself (json/urlencoded/raw/text, by content-type) and
 attaches the full Express `req`/`res` prototype ahead of time. So by the
-time a request reaches `githubRouter`, `req.body` is already populated and
-`res.json` already exists — the router just needs to route.
+time a request reaches `githubRouter`, `req.body` is already populated,
+`res.locals` is already an object, and `res.json` already exists — the
+router just needs to route.
+
+`githubAuth` is a factory rather than a middleware itself:
+`githubAuth(createOctokit)` returns the actual `(req, res, next)`
+middleware, so `src/middleware/github-auth.js` never needs to `require`
+`src/lib/client.js` — whatever `createOctokit`-shaped function it's handed
+is what gets called with the request's Bearer token. `index.js` is the only
+place that requires `src/lib/client.js` directly, and it injects
+`lazyCreateOctokit` instead of the raw `createOctokit`: a thin cache keyed
+by token in a module-scope `Map`, so a warm function instance reuses the
+same `Octokit` client across requests instead of constructing a new one
+every time.
+
+Data a middleware computes for downstream handlers — the Octokit client,
+the parsed upload files — lives on `res.locals` (`res.locals.octokit`,
+`res.locals.files`), not on `req`. `req` stays limited to what the request
+itself actually carries (`req.params`, `req.query`, `req.body`).
 
 Auth is per-request and stateless: each call must send `Authorization: Bearer <github token>`.
-No token is stored on the server.
+No token is stored on the server past the lifetime of the warm function instance.
 
 ## Health check
 
@@ -171,7 +203,11 @@ POST /github/repos/user/my-app-a82f91cd/branches/from
   pulls it directly from source: `"simple-router-builder": "github:dash-xd/simple-router-builder#main"`.
   `npm install` needs read access to that repo.
 - Routing uses `simple-router-builder`'s `NewEmptyRouter()` end to end — this
-  project doesn't depend on `express` at all. `req.body`/`req.query`/`res.json`
+  project doesn't depend on `express` at all. `req.body`/`req.query`/`res.json`/`res.locals`
   still work because `@google-cloud/functions-framework` supplies them via its
   own internal Express app before `Main` is ever invoked.
+- Octokit clients are cached per Bearer token in a module-scope `Map`
+  (`octokitByToken` in `index.js`), so a warm invocation reuses the same
+  client instead of constructing a new one on every request. The cache
+  lives only as long as the warm container does.
 - `@octokit/rest` is pinned to `^20` because `^21` and later are ESM-only and this project uses CommonJS (`require`), matching the Cloud Functions entry point convention.
