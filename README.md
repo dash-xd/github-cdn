@@ -8,6 +8,7 @@ through the GitHub Git Data API via Octokit — no local `git clone` involved.
 
 ```
 index.js                       Cloud Function entry point: builds the router and exports Main
+openapi.json                   OpenAPI 3.2.0 document describing every route
 src/
   lib/
     client.js                  createOctokit(token) -> Octokit instance
@@ -16,6 +17,7 @@ src/
     github-auth.js             githubAuth(createOctokit): returns a middleware that builds res.locals.octokit from the request's Bearer token
     upload.js                  parseUpload: busboy multipart parser + SHA-256 content addressing; writes res.locals.files, plus objectPath()
     github-repos.js            one middleware function per route (createRepoHandler, uploadObjectsHandler, ...) plus handleError
+    docs.js                    serveDocsPage / serveOpenApiDocument for /docs
 ```
 
 There's no `routes/` directory: index.js imports the middleware functions
@@ -39,19 +41,18 @@ const {
     createBranchFromHandler,
     handleError
 } = require("./src/middleware/github-repos.js");
+const { serveOpenApiDocument, serveDocsPage } = require("./src/middleware/docs.js");
 
 // One Octokit instance per token, reused for the lifetime of this warm
 // function instance instead of being rebuilt on every request.
-const octokitByToken = new Map();
+const octokits = new Map();
 
 function lazyCreateOctokit(token) {
-    let octokit = octokitByToken.get(token);
-
+    let octokit = octokits.get(token);
     if (!octokit) {
         octokit = createOctokit(token);
-        octokitByToken.set(token, octokit);
+        octokits.set(token, octokit);
     }
-
     return octokit;
 }
 
@@ -65,29 +66,35 @@ const githubRouter = NewEmptyRouter()
     .post("/repos/:owner/:repo/branches/from", createBranchFromHandler)
     .use(handleError);
 
+const docsRouter = NewEmptyRouter()
+    .get("/", serveDocsPage)
+    .get("/openapi.json", serveOpenApiDocument);
+
 function rootHandler(req, res) {
     // GET /healthz -> { status: "ok" }; everything else unmatched -> 404
 }
 
 exports.Main = new SimpleRouterBuilder()
     .withChildRouter("/github", githubRouter)
+    .withChildRouter("/docs", docsRouter)
     .withRootHandler(rootHandler)
     .build();
 ```
 
-`githubRouter` is built with `NewEmptyRouter()` from `simple-router-builder`
-— a thin wrapper around the standalone `router` package (the same routing
-engine Express's own `Router` is built on), not `express.Router()`. This
-project has no direct dependency on `express` at all.
+`githubRouter` and `docsRouter` are built with `NewEmptyRouter()` from
+`simple-router-builder` — a thin wrapper around the standalone `router`
+package (the same routing engine Express's own `Router` is built on), not
+`express.Router()`. This project has no direct dependency on `express` at
+all.
 
 That still works with `res.json`/`res.status`/`res.locals`/`req.query`/`req.body`
 because `@google-cloud/functions-framework` (run via `npx`, see below)
 wraps everything in its own Express app *before* calling `Main` — it parses
 the request body itself (json/urlencoded/raw/text, by content-type) and
 attaches the full Express `req`/`res` prototype ahead of time. So by the
-time a request reaches `githubRouter`, `req.body` is already populated,
-`res.locals` is already an object, and `res.json` already exists — the
-router just needs to route.
+time a request reaches a router, `req.body` is already populated, `res.locals`
+is already an object, and `res.json` already exists — the routers just need
+to route.
 
 `githubAuth` is a factory rather than a middleware itself:
 `githubAuth(createOctokit)` returns the actual `(req, res, next)`
@@ -107,13 +114,30 @@ itself actually carries (`req.params`, `req.query`, `req.body`).
 
 Auth is per-request and stateless: each call must send `Authorization: Bearer <github token>`.
 No token is stored on the server past the lifetime of the warm function instance.
+`GET /docs` and `GET /docs/openapi.json` don't require auth.
+
+## API reference
+
+`GET /docs` serves an interactive API reference generated from
+`openapi.json`, rendered with [Scalar](https://github.com/scalar/scalar) —
+the whole page is one `<script id="api-reference" data-url="/docs/openapi.json">`
+tag plus Scalar's CDN loader script, no build step or npm dependency.
+Scalar was chosen over Swagger UI because it renders OpenAPI 3.1/3.2
+documents natively; Swagger UI's 3.2 support landed later and is less
+complete as of this writing. `GET /docs/openapi.json` serves the raw
+document (`openapi.json` at the repo root) for any other tool that wants
+to consume it directly (Postman, Insomnia, codegen, etc.).
+
+The spec documents every route below, including request/response schemas,
+the bearer-token security scheme, and worked examples for the upload and
+delete bodies.
 
 ## Health check
 
 There's no dedicated health router — `GET /healthz` is answered directly by
 the `SimpleRouterBuilder` root handler in `index.js` with `{ "status": "ok" }`.
-Any other request that doesn't match `/github/...` or `/healthz` gets a
-plain 404 from that same root handler.
+Any other request that doesn't match `/github/...`, `/docs`, or `/healthz`
+gets a plain 404 from that same root handler.
 
 ## Object model
 
@@ -148,6 +172,8 @@ The Cloud Functions runtime is not installed as a dependency; it's fetched on de
 npm install
 npm run dev   # npx @google-cloud/functions-framework --target=Main --port=8080
 ```
+
+Then open `http://localhost:8080/docs` for the API reference.
 
 ## Routes (mounted under `/github`)
 
@@ -207,7 +233,12 @@ POST /github/repos/user/my-app-a82f91cd/branches/from
   still work because `@google-cloud/functions-framework` supplies them via its
   own internal Express app before `Main` is ever invoked.
 - Octokit clients are cached per Bearer token in a module-scope `Map`
-  (`octokitByToken` in `index.js`), so a warm invocation reuses the same
-  client instead of constructing a new one on every request. The cache
-  lives only as long as the warm container does.
+  (`octokits` in `index.js`), so a warm invocation reuses the same client
+  instead of constructing a new one on every request. The cache lives only
+  as long as the warm container does.
 - `@octokit/rest` is pinned to `^20` because `^21` and later are ESM-only and this project uses CommonJS (`require`), matching the Cloud Functions entry point convention.
+- `openapi.json` uses a couple of genuine OpenAPI 3.2.0 additions where they
+  fit naturally: the top-level `$self` field for document identity, and the
+  new `Tag.summary` field. It doesn't reach for 3.2 features that don't
+  apply to this API's shape (streaming media types, `additionalOperations`
+  for non-standard verbs).
