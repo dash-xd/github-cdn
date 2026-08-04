@@ -14,6 +14,7 @@ const {
     createBranchFromHandler,
     handleError
 } = require("./src/middleware/github-repos.js");
+const { serveOpenApiDocument, serveDocsPage } = require("./src/middleware/docs.js");
 
 const octokits = new Map();
 
@@ -36,6 +37,10 @@ const githubRouter = NewEmptyRouter()
     .post("/repos/:owner/:repo/branches/from", createBranchFromHandler)
     .use(handleError)
 
+const docsRouter = NewEmptyRouter()
+    .get("/", serveDocsPage)
+    .get("/openapi.json", serveOpenApiDocument)
+
 function rootHandler(req, res) {
     const path = (req.url || "").split("?")[0];
     if (req.method === "GET") {
@@ -50,5 +55,6 @@ function rootHandler(req, res) {
 
 exports.Main = new SimpleRouterBuilder()
     .withChildRouter("/github", githubRouter)
+    .withChildRouter("/docs", docsRouter)
     .withRootHandler(rootHandler)
     .build();
