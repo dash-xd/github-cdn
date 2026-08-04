@@ -1,0 +1,419 @@
+{
+  "openapi": "3.2.0",
+  "$self": "/openapi.json",
+  "info": {
+    "title": "github-cdn",
+    "summary": "GitHub as a content-addressed object store, over HTTP.",
+    "description": "Creates repos, stores files as content-addressed objects, snapshots branches without cloning, deletes objects, and manages branches - all through the GitHub Git Data API via Octokit. See the project README for the object model rationale.",
+    "version": "1.0.0",
+    "license": { "name": "MIT" }
+  },
+  "servers": [
+    { "url": "/", "description": "Same origin as this documentation page" }
+  ],
+  "tags": [
+    { "name": "Repositories", "summary": "Create and inspect repos" },
+    { "name": "Objects", "summary": "Content-addressed file storage" },
+    { "name": "Branches", "summary": "Branch creation" },
+    { "name": "Meta", "summary": "Health and service metadata" }
+  ],
+  "security": [{ "githubToken": [] }],
+  "components": {
+    "securitySchemes": {
+      "githubToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "GitHub personal access token",
+        "description": "Sent as `Authorization: Bearer <token>`. Forwarded directly to the GitHub API via Octokit; never stored past the lifetime of the warm function instance."
+      }
+    },
+    "parameters": {
+      "owner": {
+        "name": "owner",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" },
+        "example": "dash-xd"
+      },
+      "repo": {
+        "name": "repo",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" },
+        "example": "my-app-a82f91cd"
+      },
+      "branch": {
+        "name": "branch",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" },
+        "example": "main"
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or malformed `Authorization: Bearer <token>` header.",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      },
+      "BadRequest": {
+        "description": "Malformed request body or parameters.",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" }
+        }
+      },
+      "Repo": {
+        "type": "object",
+        "required": ["name", "owner", "url", "default_branch"],
+        "properties": {
+          "name": { "type": "string", "example": "my-app-a82f91cd" },
+          "owner": { "type": "string", "example": "dash-xd" },
+          "url": { "type": "string", "format": "uri" },
+          "default_branch": { "type": "string", "example": "main" }
+        }
+      },
+      "StoredObject": {
+        "type": "object",
+        "required": ["objectId", "path", "size"],
+        "properties": {
+          "objectId": {
+            "type": "string",
+            "description": "SHA-256 of the raw file bytes.",
+            "example": "a3f5c9d8e9f0"
+          },
+          "path": {
+            "type": "string",
+            "description": "Content-addressed storage path: objects/<hash prefix>/<hash>.",
+            "example": "objects/a3/a3f5c9d8e9f0"
+          },
+          "name": {
+            "type": ["string", "null"],
+            "description": "Original filename, informational only - never affects storage location.",
+            "example": "example.tar.gz"
+          },
+          "contentType": {
+            "type": ["string", "null"],
+            "example": "application/gzip"
+          },
+          "size": { "type": "integer", "example": 1048576 }
+        }
+      },
+      "UploadResult": {
+        "type": "object",
+        "required": ["repo", "branch", "commit", "objects"],
+        "properties": {
+          "repo": { "type": "string" },
+          "branch": { "type": "string" },
+          "commit": { "type": "string", "description": "Git commit SHA that wrote these objects." },
+          "objects": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/StoredObject" }
+          }
+        }
+      },
+      "TreeEntry": {
+        "type": "object",
+        "required": ["path", "mode", "type", "sha"],
+        "properties": {
+          "path": { "type": "string" },
+          "mode": { "type": "string", "example": "100644" },
+          "type": { "type": "string", "enum": ["blob"] },
+          "sha": { "type": "string" },
+          "size": { "type": "integer" },
+          "url": { "type": "string", "format": "uri" },
+          "encoding": {
+            "type": "string",
+            "enum": ["base64"],
+            "description": "Present only when the request set content=true."
+          },
+          "content": {
+            "type": "string",
+            "description": "Base64-encoded blob content, present only when the request set content=true."
+          }
+        }
+      },
+      "BranchResult": {
+        "type": "object",
+        "required": ["repo", "branch", "commit"],
+        "properties": {
+          "repo": { "type": "string" },
+          "branch": { "type": "string" },
+          "commit": { "type": "string" }
+        }
+      },
+      "BranchFromResult": {
+        "type": "object",
+        "required": ["repo", "branch", "from", "sha"],
+        "properties": {
+          "repo": { "type": "string" },
+          "branch": { "type": "string" },
+          "from": { "type": "string" },
+          "sha": { "type": "string" }
+        }
+      },
+      "DeleteResult": {
+        "type": "object",
+        "required": ["repo", "branch", "commit"],
+        "properties": {
+          "repo": { "type": "string" },
+          "branch": { "type": "string" },
+          "commit": { "type": "string" }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Liveness check",
+        "tags": ["Meta"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": { "status": { "type": "string", "enum": ["ok"] } }
+                },
+                "examples": { "ok": { "value": { "status": "ok" } } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/github/repos/{name}": {
+      "post": {
+        "operationId": "createRepo",
+        "summary": "Create a repository",
+        "description": "Creates a new GitHub repository named `<name>-<random8>`.",
+        "tags": ["Repositories"],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" }, "example": "my-app" }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "private": { "type": "boolean", "default": true }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Repository created.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Repo" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/github/repos/{owner}/{repo}/upload": {
+      "post": {
+        "operationId": "uploadObjects",
+        "summary": "Upload files as content-addressed objects",
+        "description": "Each uploaded file is hashed (SHA-256) and stored at `objects/<hash prefix>/<hash>`. Re-uploading identical bytes is idempotent, and duplicate content within one request is written once. Accepts any form field name(s) for file parts. See the README's Object model section.",
+        "tags": ["Objects"],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" },
+          {
+            "name": "branch",
+            "in": "query",
+            "required": false,
+            "description": "Defaults to the repo's default branch. May also be sent as a `branch` form field instead.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "contentMediaType": "application/octet-stream",
+                    "description": "A file part. Repeat with any field name(s) to upload multiple files in one request."
+                  },
+                  "branch": { "type": "string" }
+                }
+              },
+              "encoding": {
+                "file": { "contentType": "application/octet-stream" }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Files stored.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadResult" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "413": {
+            "description": "A file exceeded the 25MB upload limit.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/github/repos/{owner}/{repo}/{branch}": {
+      "get": {
+        "operationId": "getBranchSnapshot",
+        "summary": "Snapshot a branch without cloning",
+        "description": "Returns the branch's file tree via the Git Data API.",
+        "tags": ["Repositories"],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" },
+          { "$ref": "#/components/parameters/branch" },
+          {
+            "name": "content",
+            "in": "query",
+            "required": false,
+            "description": "Set to `true` to include each blob's base64 content.",
+            "schema": { "type": "string", "enum": ["true", "false"], "default": "false" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Branch file tree.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/TreeEntry" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "delete": {
+        "operationId": "deleteObjects",
+        "summary": "Delete one or more objects",
+        "description": "Accepts raw tree paths (`path`/`paths`) or content-addressed object ids (`objectId`/`objectIds`).",
+        "tags": ["Objects"],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" },
+          { "$ref": "#/components/parameters/branch" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "path": { "type": "string" },
+                  "paths": { "type": "array", "items": { "type": "string" } },
+                  "objectId": { "type": "string" },
+                  "objectIds": { "type": "array", "items": { "type": "string" } }
+                }
+              },
+              "examples": {
+                "byObjectIds": { "value": { "objectIds": ["a3f5c9d8e9f0"] } },
+                "byPath": { "value": { "paths": ["objects/a3/a3f5c9d8e9f0"] } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Objects deleted in a single commit.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteResult" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/github/repos/{owner}/{repo}/branches": {
+      "post": {
+        "operationId": "createEmptyBranch",
+        "summary": "Create a new empty branch",
+        "description": "An orphan commit with no tree entries and no parents.",
+        "tags": ["Branches"],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["branch"],
+                "properties": { "branch": { "type": "string", "example": "empty-branch" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Branch created.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BranchResult" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/github/repos/{owner}/{repo}/branches/from": {
+      "post": {
+        "operationId": "createBranchFrom",
+        "summary": "Create a branch from an existing branch",
+        "tags": ["Branches"],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["branch", "source"],
+                "properties": {
+                  "branch": { "type": "string", "example": "feature" },
+                  "source": { "type": "string", "example": "main" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Branch created.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BranchFromResult" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    }
+  }
+}
