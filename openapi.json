@@ -15,6 +15,8 @@
     { "name": "Repositories", "summary": "Create and inspect repos" },
     { "name": "Objects", "summary": "Content-addressed file storage" },
     { "name": "Branches", "summary": "Branch creation" },
+    { "name": "App", "summary": "Same operations as Repositories/Objects/Branches, authenticated as the GitHub App installation instead of a caller token" },
+    { "name": "Setup", "summary": "Bootstrap a GitHub App for an org" },
     { "name": "Meta", "summary": "Health and service metadata" }
   ],
   "security": [{ "githubToken": [] }],
@@ -25,6 +27,12 @@
         "scheme": "bearer",
         "bearerFormat": "GitHub personal access token",
         "description": "Sent as `Authorization: Bearer <token>`. Forwarded directly to the GitHub API via Octokit; never stored past the lifetime of the warm function instance."
+      },
+      "accessSecret": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "Shared secret (APP_ROUTER_SECRET)",
+        "description": "Sent as `Authorization: Bearer <secret>`. /app authenticates to GitHub as the app installation itself, so there's no caller-supplied GitHub token to double as authorization the way there is for /github - this shared secret is the substitute."
       }
     },
     "parameters": {
@@ -168,6 +176,28 @@
           "repo": { "type": "string" },
           "branch": { "type": "string" },
           "commit": { "type": "string" }
+        }
+      },
+      "AppCredentials": {
+        "type": "object",
+        "description": "Returned exactly once by the manifest callback - not stored anywhere by this service.",
+        "properties": {
+          "id": { "type": "integer", "description": "GITHUB_APP_ID" },
+          "slug": { "type": "string" },
+          "client_id": { "type": "string" },
+          "client_secret": { "type": "string" },
+          "webhook_secret": { "type": "string" },
+          "pem": { "type": "string", "description": "GITHUB_APP_PRIVATE_KEY - the app's private key." },
+          "html_url": { "type": "string", "format": "uri" },
+          "note": { "type": "string" }
+        }
+      },
+      "Installation": {
+        "type": "object",
+        "properties": {
+          "installationId": { "type": "integer", "description": "GITHUB_APP_INSTALLATION_ID" },
+          "account": { "type": "string" },
+          "targetType": { "type": "string", "enum": ["Organization", "User"] }
         }
       }
     }
@@ -412,6 +442,285 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/app/repos/{org}/{name}": {
+      "post": {
+        "operationId": "createOrgRepo",
+        "summary": "Create a repository in an org, as the app",
+        "description": "Like POST /github/repos/{name}, but authenticated as the app installation and scoped to an org: installation tokens have no \"authenticated user\" to create a personal repo under, so this goes through POST /orgs/{org}/repos instead.",
+        "tags": ["App"],
+        "security": [{ "accessSecret": [] }],
+        "parameters": [
+          { "name": "org", "in": "path", "required": true, "schema": { "type": "string" }, "example": "dash-xd" },
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" }, "example": "my-app" }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "private": { "type": "boolean", "default": true }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Repository created.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Repo" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/app/repos/{owner}/{repo}/upload": {
+      "post": {
+        "operationId": "appUploadObjects",
+        "summary": "Upload files as content-addressed objects, as the app",
+        "description": "Identical behavior to POST /github/repos/{owner}/{repo}/upload - same handler, different auth.",
+        "tags": ["App"],
+        "security": [{ "accessSecret": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" },
+          {
+            "name": "branch",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": { "type": "string", "contentMediaType": "application/octet-stream" },
+                  "branch": { "type": "string" }
+                }
+              },
+              "encoding": {
+                "file": { "contentType": "application/octet-stream" }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Files stored.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadResult" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "413": {
+            "description": "A file exceeded the 25MB upload limit.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/app/repos/{owner}/{repo}/{branch}": {
+      "get": {
+        "operationId": "appGetBranchSnapshot",
+        "summary": "Snapshot a branch without cloning, as the app",
+        "description": "Identical behavior to GET /github/repos/{owner}/{repo}/{branch} - same handler, different auth.",
+        "tags": ["App"],
+        "security": [{ "accessSecret": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" },
+          { "$ref": "#/components/parameters/branch" },
+          {
+            "name": "content",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "enum": ["true", "false"], "default": "false" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Branch file tree.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/TreeEntry" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "delete": {
+        "operationId": "appDeleteObjects",
+        "summary": "Delete one or more objects, as the app",
+        "description": "Identical behavior to DELETE /github/repos/{owner}/{repo}/{branch} - same handler, different auth.",
+        "tags": ["App"],
+        "security": [{ "accessSecret": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" },
+          { "$ref": "#/components/parameters/branch" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "path": { "type": "string" },
+                  "paths": { "type": "array", "items": { "type": "string" } },
+                  "objectId": { "type": "string" },
+                  "objectIds": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Objects deleted in a single commit.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteResult" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/app/repos/{owner}/{repo}/branches": {
+      "post": {
+        "operationId": "appCreateEmptyBranch",
+        "summary": "Create a new empty branch, as the app",
+        "description": "Identical behavior to POST /github/repos/{owner}/{repo}/branches - same handler, different auth.",
+        "tags": ["App"],
+        "security": [{ "accessSecret": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["branch"],
+                "properties": { "branch": { "type": "string", "example": "empty-branch" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Branch created.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BranchResult" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/app/repos/{owner}/{repo}/branches/from": {
+      "post": {
+        "operationId": "appCreateBranchFrom",
+        "summary": "Create a branch from an existing branch, as the app",
+        "description": "Identical behavior to POST /github/repos/{owner}/{repo}/branches/from - same handler, different auth.",
+        "tags": ["App"],
+        "security": [{ "accessSecret": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/owner" },
+          { "$ref": "#/components/parameters/repo" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["branch", "source"],
+                "properties": {
+                  "branch": { "type": "string", "example": "feature" },
+                  "source": { "type": "string", "example": "main" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Branch created.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BranchFromResult" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/setup": {
+      "get": {
+        "operationId": "serveManifestForm",
+        "summary": "Start GitHub App creation for an org",
+        "description": "Renders a page that auto-submits GitHub's app-manifest form. Requires PUBLIC_BASE_URL to be configured server-side so redirect_url can be built correctly.",
+        "tags": ["Setup"],
+        "security": [],
+        "parameters": [
+          { "name": "org", "in": "query", "required": true, "schema": { "type": "string" }, "example": "dash-xd" }
+        ],
+        "responses": {
+          "200": {
+            "description": "An HTML page that auto-submits to github.com/organizations/{org}/settings/apps/new.",
+            "content": { "text/html": { "schema": { "type": "string" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "500": {
+            "description": "PUBLIC_BASE_URL is not configured.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/setup/callback": {
+      "get": {
+        "operationId": "handleManifestCallback",
+        "summary": "Exchange the manifest flow's code for app credentials",
+        "description": "GitHub redirects here after the operator confirms app creation. Returns the new app's credentials exactly once - copy them into GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY and redeploy.",
+        "tags": ["Setup"],
+        "security": [],
+        "parameters": [
+          { "name": "code", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "The new app's credentials.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AppCredentials" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/setup/installations": {
+      "get": {
+        "operationId": "listInstallations",
+        "summary": "List this app's installations",
+        "description": "App-level (JWT) auth only, no installation id required - use this to find GITHUB_APP_INSTALLATION_ID once GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY are set.",
+        "tags": ["Setup"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Installations of this app.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Installation" } }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" }
         }
       }
     }
