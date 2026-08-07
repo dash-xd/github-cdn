@@ -28,6 +28,24 @@ async function getDefaultBranch(octokit, owner, repo) {
     return data.default_branch;
 }
 
+// Like createRepo, but for callers authenticated as a GitHub App
+// installation rather than a user. Installation tokens have no
+// "authenticated user" to create a repo under - POST /user/repos isn't
+// available to them - so org-owned repos have to go through
+// POST /orgs/{org}/repos instead.
+async function createOrgRepo(octokit, org, name, options = {}) {
+    const repoName = `${sanitizeName(name)}-${randomUUID().slice(0, 8)}`;
+
+    const { data } = await octokit.rest.repos.createInOrg({
+        org,
+        name: repoName,
+        private: options.private ?? true,
+        auto_init: true
+    });
+
+    return data;
+}
+
 // Writes each uploaded file to its content-addressed path (see
 // middleware/upload.js#objectPath) in a single commit. Storage identity
 // comes from the content hash, not the caller-supplied filename, so
@@ -260,6 +278,7 @@ async function createBranchFrom(octokit, owner, repo, newBranch, sourceBranch) {
 
 module.exports = {
     createRepo,
+    createOrgRepo,
     getDefaultBranch,
     commitFiles,
     getBranchSnapshot,
