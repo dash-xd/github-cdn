@@ -1,6 +1,6 @@
 {
   "openapi": "3.2.0",
-  "$self": "/openapi.json",
+  "$self": "openapi.json",
   "info": {
     "title": "github-cdn",
     "summary": "GitHub as a content-addressed object store, over HTTP.",
@@ -9,7 +9,7 @@
     "license": { "name": "MIT" }
   },
   "servers": [
-    { "url": "/", "description": "Same origin as this documentation page" }
+    { "url": "..", "description": "Function root, relative to where this document is served (/docs/openapi.json)" }
   ],
   "tags": [
     { "name": "Repositories", "summary": "Create and inspect repos" },
