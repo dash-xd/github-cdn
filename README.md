@@ -11,12 +11,17 @@ index.js                       Cloud Function entry point: builds the router and
 openapi.json                   OpenAPI 3.2.0 document describing every route
 src/
   lib/
-    client.js                  createOctokit(token) -> Octokit instance
-    repo-service.js            GitHub Git Data API service layer (createRepo, commitFiles, getBranchSnapshot, deleteFiles, createEmptyBranch, createBranchFrom)
+    client.js                  createOctokit(token) -> Octokit instance (personal access token)
+    app-client.js               createInstallationOctokit / createAppLevelOctokit -> Octokit instances (GitHub App auth)
+    repo-service.js            GitHub Git Data API service layer (createRepo, createOrgRepo, commitFiles, getBranchSnapshot, deleteFiles, createEmptyBranch, createBranchFrom)
   middleware/
     github-auth.js             githubAuth(createOctokit): returns a middleware that builds res.locals.octokit from the request's Bearer token
+    app-auth.js                 appAuth(getInstallationOctokit): returns a middleware that builds res.locals.octokit as the app installation - no per-request token
+    access-secret.js            requireAccessSecret(getSecret): gates /app with a shared secret, since there's no caller GitHub token to double as one
     upload.js                  parseUpload: busboy multipart parser + SHA-256 content addressing; writes res.locals.files, plus objectPath()
-    github-repos.js            one middleware function per route (createRepoHandler, uploadObjectsHandler, ...) plus handleError
+    github-repos.js            one middleware function per /github route (createRepoHandler, uploadObjectsHandler, ...) plus handleError
+    app-repos.js                 createOrgRepoHandler: the one /app route that can't reuse a github-repos.js handler
+    app-setup.js                 serveManifestForm / handleManifestCallback / listInstallationsHandler for /setup
     docs.js                    serveDocsPage / serveOpenApiDocument for /docs
 ```
 
@@ -24,64 +29,118 @@ There's no `routes/` directory: index.js imports the middleware functions
 above and wires up the router itself, rather than importing a pre-built
 router module.
 
-`index.js`, in full:
+## Two ways to authenticate
 
-```js
-const { SimpleRouterBuilder, NewEmptyRouter } = require("simple-router-builder");
+There are two independent routers that expose almost the same operations,
+authenticated two different ways:
 
-const { createOctokit } = require("./src/lib/client.js");
-const { githubAuth } = require("./src/middleware/github-auth.js");
-const { parseUpload } = require("./src/middleware/upload.js");
-const {
-    createRepoHandler,
-    uploadObjectsHandler,
-    getBranchSnapshotHandler,
-    deleteObjectsHandler,
-    createEmptyBranchHandler,
-    createBranchFromHandler,
-    handleError
-} = require("./src/middleware/github-repos.js");
-const { serveOpenApiDocument, serveDocsPage } = require("./src/middleware/docs.js");
+- **`/github`** — the caller brings their own GitHub personal access token
+  (`Authorization: Bearer <token>`), forwarded straight through to Octokit.
+  Whoever holds the token is authorized for whatever that token can do.
+- **`/app`** — the function authenticates to GitHub itself, as an
+  installation of a GitHub App, using credentials configured on the
+  function (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_INSTALLATION_ID`).
+  Callers never see or provide a GitHub credential at all.
 
-// One Octokit instance per token, reused for the lifetime of this warm
-// function instance instead of being rebuilt on every request.
-const octokits = new Map();
+`/app` reuses every `github-repos.js` handler except repo creation - they
+only ever read `res.locals.octokit`, so they don't care whether it was
+built from a caller's PAT or an installation token. Repo creation is the
+one place that can't be shared: installation tokens have no "authenticated
+user" the way a PAT does, so `POST /user/repos` isn't available to them -
+creating an org-owned repo has to go through `POST /orgs/{org}/repos`
+instead (`createOrgRepo` in `repo-service.js`), which is why `/app`'s
+create-repo route takes `:org` explicitly (`POST /app/repos/{org}/{name}`)
+instead of assuming "whoever the token belongs to" the way `/github`'s
+`POST /repos/{name}` does.
 
-function lazyCreateOctokit(token) {
-    let octokit = octokits.get(token);
-    if (!octokit) {
-        octokit = createOctokit(token);
-        octokits.set(token, octokit);
-    }
-    return octokit;
-}
+Because `/app` has no caller-supplied token, it has no caller-side
+authorization either - authenticating to *GitHub* as the installation says
+nothing about who's allowed to *call this function*. `requireAccessSecret`
+is the substitute: every `/app` request must present a server-configured
+shared secret as `Authorization: Bearer <APP_ROUTER_SECRET>`. Treat that
+secret the same way you'd treat the GitHub App's own private key.
 
-const githubRouter = NewEmptyRouter()
-    .use(githubAuth(lazyCreateOctokit))
-    .post("/repos/:name", createRepoHandler)
-    .post("/repos/:owner/:repo/upload", parseUpload, uploadObjectsHandler)
-    .get("/repos/:owner/:repo/:branch", getBranchSnapshotHandler)
-    .delete("/repos/:owner/:repo/:branch", deleteObjectsHandler)
-    .post("/repos/:owner/:repo/branches", createEmptyBranchHandler)
-    .post("/repos/:owner/:repo/branches/from", createBranchFromHandler)
-    .use(handleError);
+### Required env vars for `/app`
 
-const docsRouter = NewEmptyRouter()
-    .get("/", serveDocsPage)
-    .get("/openapi.json", serveOpenApiDocument);
+| Var | What |
+| --- | --- |
+| `APP_ROUTER_SECRET` | Shared secret gating `/app`. Generate something long and random; there's no other check standing between the internet and your org's repos on this router. |
+| `GITHUB_APP_ID` | The App's numeric id. |
+| `GITHUB_APP_PRIVATE_KEY` | The App's PEM private key. `\n`-escaped values (common when env vars can't hold real newlines) are unescaped automatically. |
+| `GITHUB_APP_INSTALLATION_ID` | The installation id for your org. One installation per deployment - if the App is installed on multiple orgs, deploy separate function instances with different `GITHUB_APP_INSTALLATION_ID` values. |
 
-function rootHandler(req, res) {
-    // GET /healthz -> { status: "ok" }; everything else unmatched -> 404
-}
+The installation `Octokit` is built once (lazily, on first request that
+needs it) and reused for the life of the warm container -
+`@octokit/auth-app` handles refreshing the installation token internally,
+so there's no need to rebuild the client per request.
 
-exports.Main = new SimpleRouterBuilder()
-    .withChildRouter("/github", githubRouter)
-    .withChildRouter("/docs", docsRouter)
-    .withRootHandler(rootHandler)
-    .build();
-```
+## Bootstrapping a GitHub App (`/setup`)
 
-`githubRouter` and `docsRouter` are built with `NewEmptyRouter()` from
+If you don't have a GitHub App yet, `/setup` creates one for an org using
+[GitHub's manifest flow](https://docs.github.com/apps/sharing-github-apps/registering-a-github-app-from-a-manifest) -
+the same mechanism tools like Probot use, adapted for a stateless Cloud
+Function. Three steps:
+
+1. **`GET /setup?org=<org-login>`** — renders a page that auto-submits a
+   form to `github.com/organizations/<org>/settings/apps/new`. You'll need
+   to be signed into GitHub with admin rights on that org. Requires
+   `PUBLIC_BASE_URL` to be set to this function's actual public URL (e.g.
+   `https://us-central1-<project>.cloudfunctions.net/<function-name>`) -
+   the function can't work this out from the request itself, because Cloud
+   Functions strips the function-name path segment before the code ever
+   sees `req.url` (the same constraint that shaped `/docs`' relative URLs).
+2. **Confirm on GitHub.** GitHub creates the App and redirects to
+   `GET /setup/callback?code=...`.
+3. **`GET /setup/callback`** exchanges that one-time code for the App's
+   real credentials and returns them as JSON: `id` (→ `GITHUB_APP_ID`),
+   `pem` (→ `GITHUB_APP_PRIVATE_KEY`), `client_id`, `client_secret`,
+   `webhook_secret`. **This is the only time they're ever shown - nothing
+   is stored anywhere.** Copy `id` and `pem` into the function's env vars
+   and redeploy.
+
+Then, once the App is installed on the org (GitHub prompts for this as
+part of app creation, or install it manually from the App's settings
+page): **`GET /setup/installations`** lists installations using app-level
+(JWT) auth - no installation id required yet - so you can read off the
+right `GITHUB_APP_INSTALLATION_ID`.
+
+The manifest requests `contents: write` and `metadata: read` on
+repositories, and `organization_administration: write` at the org level
+(required to create repos via the App - see
+[GitHub's repo-creation permission requirements](https://docs.github.com/rest/repos/repos#create-an-organization-repository)).
+No webhook is requested (`default_events: []`, no `hook_attributes`) -
+this function is request/response only, it doesn't handle webhook events.
+
+**`/setup` and `/app` are unauthenticated and authenticated respectively,
+but neither is meant to be a public-facing feature.** `/setup` is a
+one-time admin bootstrap action; if it's reachable by anyone, the worst
+case is someone else completing *their own* app-creation flow against your
+redirect URL, which only shows *them* credentials for an app *they* just
+created - not a compromise of anything of yours. `/app`'s exposure is
+real, though: it performs privileged repo operations across your org using
+credentials the caller never has to prove they should have access to,
+gated only by `APP_ROUTER_SECRET`. If this function is deployed with
+`--allow-unauthenticated` (needed for `/github`, `/docs`, and `/healthz`
+to be reachable at all), that shared secret is the only thing standing
+between the internet and `/app` - there's no IAM-level way to protect just
+one router within a single Cloud Function. Consider whether `/app` and
+`/setup` belong in a separate, more tightly-scoped deployment instead of
+alongside the public-facing routes, if that risk doesn't sit well with
+your threat model.
+
+## Layered auth in `index.js`
+
+`githubAuth` and `appAuth` are both factories rather than middleware
+themselves: each takes a "give me an authenticated Octokit" closure and
+returns the actual `(req, res, next)` middleware. Neither
+`src/middleware/github-auth.js` nor `src/middleware/app-auth.js` requires
+`src/lib/client.js` / `src/lib/app-client.js` directly - `index.js` is the
+only place that does, and it's what injects `lazyCreateOctokit` /
+`getInstallationOctokit` into them. This is the same pattern in both
+places: the middleware knows *how* to attach an Octokit client to the
+request, `index.js` decides *which* one.
+
+`githubRouter` and `appRouter` are both built with `NewEmptyRouter()` from
 `simple-router-builder` — a thin wrapper around the standalone `router`
 package (the same routing engine Express's own `Router` is built on), not
 `express.Router()`. This project has no direct dependency on `express` at
@@ -96,31 +155,16 @@ time a request reaches a router, `req.body` is already populated, `res.locals`
 is already an object, and `res.json` already exists — the routers just need
 to route.
 
-`githubAuth` is a factory rather than a middleware itself:
-`githubAuth(createOctokit)` returns the actual `(req, res, next)`
-middleware, so `src/middleware/github-auth.js` never needs to `require`
-`src/lib/client.js` — whatever `createOctokit`-shaped function it's handed
-is what gets called with the request's Bearer token. `index.js` is the only
-place that requires `src/lib/client.js` directly, and it injects
-`lazyCreateOctokit` instead of the raw `createOctokit`: a thin cache keyed
-by token in a module-scope `Map`, so a warm function instance reuses the
-same `Octokit` client across requests instead of constructing a new one
-every time.
-
 Data a middleware computes for downstream handlers — the Octokit client,
 the parsed upload files — lives on `res.locals` (`res.locals.octokit`,
 `res.locals.files`), not on `req`. `req` stays limited to what the request
 itself actually carries (`req.params`, `req.query`, `req.body`).
 
-Auth is per-request and stateless: each call must send `Authorization: Bearer <github token>`.
-No token is stored on the server past the lifetime of the warm function instance.
-`GET /docs` and `GET /docs/openapi.json` don't require auth.
-
 ## API reference
 
 `GET /docs` serves an interactive API reference generated from
 `openapi.json`, rendered with [Scalar](https://github.com/scalar/scalar) —
-the whole page is one `<script id="api-reference" data-url="/docs/openapi.json">`
+the whole page is one `<script id="api-reference" data-url="docs/openapi.json">`
 tag plus Scalar's CDN loader script, no build step or npm dependency.
 Scalar was chosen over Swagger UI because it renders OpenAPI 3.1/3.2
 documents natively; Swagger UI's 3.2 support landed later and is less
@@ -128,16 +172,16 @@ complete as of this writing. `GET /docs/openapi.json` serves the raw
 document (`openapi.json` at the repo root) for any other tool that wants
 to consume it directly (Postman, Insomnia, codegen, etc.).
 
-The spec documents every route below, including request/response schemas,
-the bearer-token security scheme, and worked examples for the upload and
-delete bodies.
+The spec documents every route below, including `/app` and `/setup`,
+request/response schemas, both security schemes (`githubToken` for
+`/github`, `accessSecret` for `/app`), and worked examples.
 
 ## Health check
 
 There's no dedicated health router — `GET /healthz` is answered directly by
 the `SimpleRouterBuilder` root handler in `index.js` with `{ "status": "ok" }`.
-Any other request that doesn't match `/github/...`, `/docs`, or `/healthz`
-gets a plain 404 from that same root handler.
+Any other request that doesn't match `/github/...`, `/app/...`, `/setup/...`,
+`/docs`, or `/healthz` gets a plain 404 from that same root handler.
 
 ## Object model
 
@@ -173,7 +217,10 @@ npm install
 npm run dev   # npx @google-cloud/functions-framework --target=Main --port=8080
 ```
 
-Then open `http://localhost:8080/docs` for the API reference.
+Then open `http://localhost:8080/docs` for the API reference. `/app` and
+`/setup` will error clearly (not silently misbehave) until their required
+env vars above are set - `/github`, `/docs`, and `/healthz` need no
+configuration at all.
 
 ## Routes (mounted under `/github`)
 
@@ -223,6 +270,28 @@ POST /github/repos/user/my-app-a82f91cd/branches/from
 { "branch": "feature", "source": "main" }
 ```
 
+## Routes (mounted under `/app` — installation auth, see above)
+
+| Method | Path | Body / Query | Description |
+| --- | --- | --- | --- |
+| POST | `/repos/:org/:name` | `{ private?: boolean }` | Create a repo named `<name>-<random8>` inside `:org` |
+| POST | `/repos/:owner/:repo/upload` | same as `/github` | Same handler as `/github`'s upload route |
+| GET | `/repos/:owner/:repo/:branch` | same as `/github` | Same handler as `/github`'s snapshot route |
+| DELETE | `/repos/:owner/:repo/:branch` | same as `/github` | Same handler as `/github`'s delete route |
+| POST | `/repos/:owner/:repo/branches` | same as `/github` | Same handler as `/github`'s create-empty-branch route |
+| POST | `/repos/:owner/:repo/branches/from` | same as `/github` | Same handler as `/github`'s branch-from route |
+
+Every `/app` request needs `Authorization: Bearer <APP_ROUTER_SECRET>`
+instead of a GitHub token.
+
+## Routes (mounted under `/setup` — see "Bootstrapping a GitHub App" above)
+
+| Method | Path | Query | Description |
+| --- | --- | --- | --- |
+| GET | `/` | `?org=<org-login>` | Start the manifest flow for `org` |
+| GET | `/callback` | `?code=...` (from GitHub's redirect) | Exchange the code for the new App's credentials (shown once) |
+| GET | `/installations` | — | List this App's installations, to find `GITHUB_APP_INSTALLATION_ID` |
+
 ## Notes
 
 - `simple-router-builder` isn't published to the npm registry, so `package.json`
@@ -232,11 +301,13 @@ POST /github/repos/user/my-app-a82f91cd/branches/from
   project doesn't depend on `express` at all. `req.body`/`req.query`/`res.json`/`res.locals`
   still work because `@google-cloud/functions-framework` supplies them via its
   own internal Express app before `Main` is ever invoked.
-- Octokit clients are cached per Bearer token in a module-scope `Map`
-  (`octokits` in `index.js`), so a warm invocation reuses the same client
-  instead of constructing a new one on every request. The cache lives only
-  as long as the warm container does.
-- `@octokit/rest` is pinned to `^20` because `^21` and later are ESM-only and this project uses CommonJS (`require`), matching the Cloud Functions entry point convention.
+- Octokit clients for `/github` are cached per Bearer token in a
+  module-scope `Map` (`octokits` in `index.js`); the `/app` Octokit is a
+  single instance built once. Both live only as long as the warm container
+  does.
+- `@octokit/rest` is pinned to `^20` and `@octokit/auth-app` to `^6`
+  because later major versions are ESM-only and this project uses
+  CommonJS (`require`), matching the Cloud Functions entry point convention.
 - `openapi.json` uses a couple of genuine OpenAPI 3.2.0 additions where they
   fit naturally: the top-level `$self` field for document identity, and the
   new `Tag.summary` field. It doesn't reach for 3.2 features that don't
