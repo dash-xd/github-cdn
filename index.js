@@ -19,6 +19,7 @@ const {
 } = require("./src/middleware/github-repos.js");
 const { createOrgRepoHandler } = require("./src/middleware/app-repos.js");
 const { serveManifestForm, handleManifestCallback, listInstallationsHandler } = require("./src/middleware/app-setup.js");
+const { serveLoginPage, handleLoginCallback } = require("./src/middleware/oauth-login.js");
 const { serveOpenApiDocument, serveDocsPage } = require("./src/middleware/docs.js");
 
 const octokits = new Map();
@@ -76,6 +77,10 @@ const githubRouter = NewEmptyRouter()
 // was built from a caller's PAT or an installation token. Repo creation
 // doesn't reuse createRepoHandler: installation tokens can't call
 // POST /user/repos, so org-owned creation needs its own :org-scoped route.
+//
+// This is for no-human-present server automation (CI, cron, etc). It's
+// not the multi-tenant self-serve path - see /login for that, which hands
+// users an ordinary GitHub token to use against /github instead.
 const appRouter = NewEmptyRouter()
     .use(requireAccessSecret(() => process.env.APP_ROUTER_SECRET))
     .use(appAuth(getInstallationOctokit))
@@ -95,6 +100,16 @@ const setupRouter = NewEmptyRouter()
     .get("/", serveManifestForm)
     .get("/callback", handleManifestCallback)
     .get("/installations", listInstallationsHandler)
+
+// Self-serve alternative to /app: a user logs in with their own GitHub
+// account (OAuth user-to-server) and gets back an ordinary GitHub token,
+// which they then use directly against /github - no new protected repo
+// API needed here, just the login page and the one step that has to be
+// server-side (the code-for-token exchange, which needs the client secret).
+const loginRouter = NewEmptyRouter()
+    .get("/", serveLoginPage)
+    .get("/callback", handleLoginCallback)
+    .use(handleError)
 
 const docsRouter = NewEmptyRouter()
     .get("/", serveDocsPage)
@@ -116,6 +131,7 @@ exports.Main = new SimpleRouterBuilder()
     .withChildRouter("/github", githubRouter)
     .withChildRouter("/app", appRouter)
     .withChildRouter("/setup", setupRouter)
+    .withChildRouter("/login", loginRouter)
     .withChildRouter("/docs", docsRouter)
     .withRootHandler(rootHandler)
     .build();
