@@ -17,6 +17,7 @@
     { "name": "Branches", "summary": "Branch creation" },
     { "name": "App", "summary": "Same operations as Repositories/Objects/Branches, authenticated as the GitHub App installation instead of a caller token" },
     { "name": "Setup", "summary": "Bootstrap a GitHub App for an org" },
+    { "name": "Login", "summary": "Self-serve OAuth login: exchange GitHub login for an ordinary token usable at /github" },
     { "name": "Meta", "summary": "Health and service metadata" }
   ],
   "security": [{ "githubToken": [] }],
@@ -721,6 +722,49 @@
             }
           },
           "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/login": {
+      "get": {
+        "operationId": "serveLoginPage",
+        "summary": "Self-serve login page",
+        "description": "Static page with a \"log in with GitHub\" link (OAuth user-to-server authorize redirect) and an \"install the app\" link. Sets a short-lived HttpOnly state cookie for CSRF protection on the callback.",
+        "tags": ["Login"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "An HTML page linking to GitHub's OAuth authorize URL and the app's install URL.",
+            "content": { "text/html": { "schema": { "type": "string" } } }
+          },
+          "500": {
+            "description": "GITHUB_APP_CLIENT_ID, PUBLIC_BASE_URL, GITHUB_APP_ID, or GITHUB_APP_PRIVATE_KEY is not configured.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/login/callback": {
+      "get": {
+        "operationId": "handleLoginCallback",
+        "summary": "OAuth callback: exchange the code for the user's own token",
+        "description": "GitHub redirects here after the user authorizes. Validates state against the cookie /login set, then exchanges the code for a user access token (needs GITHUB_APP_CLIENT_SECRET, hence server-side only). Redirects back to /login with the token in the URL fragment - never sent to a server or logged - for the page's script to read. That token is an ordinary GitHub token, used directly against /github.",
+        "tags": ["Login"],
+        "security": [],
+        "parameters": [
+          { "name": "code", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "error", "in": "query", "required": false, "description": "Set by GitHub if the user declined authorization.", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to /login#access_token=...&scope=... on success, or /login#error=... on failure."
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "500": {
+            "description": "PUBLIC_BASE_URL is not configured.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
         }
       }
     }
