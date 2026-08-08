@@ -22,6 +22,7 @@ src/
     github-repos.js            one middleware function per /github route (createRepoHandler, uploadObjectsHandler, ...) plus handleError
     app-repos.js                 createOrgRepoHandler: the one /app route that can't reuse a github-repos.js handler
     app-setup.js                 serveManifestForm / handleManifestCallback / listInstallationsHandler for /setup
+    oauth-login.js               serveLoginPage / handleLoginCallback for /login - self-serve OAuth user-to-server login
     docs.js                    serveDocsPage / serveOpenApiDocument for /docs
 ```
 
@@ -29,10 +30,7 @@ There's no `routes/` directory: index.js imports the middleware functions
 above and wires up the router itself, rather than importing a pre-built
 router module.
 
-## Two ways to authenticate
-
-There are two independent routers that expose almost the same operations,
-authenticated two different ways:
+## Three ways to authenticate
 
 - **`/github`** — the caller brings their own GitHub personal access token
   (`Authorization: Bearer <token>`), forwarded straight through to Octokit.
@@ -40,7 +38,13 @@ authenticated two different ways:
 - **`/app`** — the function authenticates to GitHub itself, as an
   installation of a GitHub App, using credentials configured on the
   function (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_INSTALLATION_ID`).
-  Callers never see or provide a GitHub credential at all.
+  No human is present in this flow at all - it's for server-to-server
+  automation (CI, cron, etc), not something an end user goes through.
+- **`/login`** — a human logs in with their own GitHub account (OAuth
+  user-to-server) and gets back an ordinary GitHub token, which they then
+  use at `/github`. This is the self-serve, multi-tenant path; `/app` is
+  the no-user-present one. They're separate purposes, not one superseding
+  the other.
 
 `/app` reuses every `github-repos.js` handler except repo creation - they
 only ever read `res.locals.octokit`, so they don't care whether it was
@@ -60,6 +64,12 @@ is the substitute: every `/app` request must present a server-configured
 shared secret as `Authorization: Bearer <APP_ROUTER_SECRET>`. Treat that
 secret the same way you'd treat the GitHub App's own private key.
 
+`/login` doesn't have (or need) an equivalent gate: the OAuth token it
+hands back is scoped to whatever the logged-in user can personally do,
+further bounded by wherever the app is installed - GitHub itself is the
+authorization boundary there, the same as any caller-supplied token at
+`/github`. See "Self-serve login" below.
+
 ### Required env vars for `/app`
 
 | Var | What |
@@ -73,6 +83,20 @@ The installation `Octokit` is built once (lazily, on first request that
 needs it) and reused for the life of the warm container -
 `@octokit/auth-app` handles refreshing the installation token internally,
 so there's no need to rebuild the client per request.
+
+### Required env vars for `/login`
+
+| Var | What |
+| --- | --- |
+| `GITHUB_APP_CLIENT_ID` | The App's OAuth client id. Not secret - it's visible in the authorize URL regardless. |
+| `GITHUB_APP_CLIENT_SECRET` | The App's OAuth client secret. Used exactly once per login, server-side only, to exchange a code for a token - never sent to the browser. |
+
+Both come from the same `/setup/callback` response as `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY`.
+`/login` also needs `PUBLIC_BASE_URL` (already required for `/setup`) and,
+to build the "install the app" link, `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY`
+(already required for `/app`) - it fetches the app's slug via JWT auth and
+caches it, rather than requiring yet another env var for something
+derivable from what's already configured.
 
 ## Bootstrapping a GitHub App (`/setup`)
 
@@ -93,10 +117,11 @@ Function. Three steps:
    `GET /setup/callback?code=...`.
 3. **`GET /setup/callback`** exchanges that one-time code for the App's
    real credentials and returns them as JSON: `id` (→ `GITHUB_APP_ID`),
-   `pem` (→ `GITHUB_APP_PRIVATE_KEY`), `client_id`, `client_secret`,
-   `webhook_secret`. **This is the only time they're ever shown - nothing
-   is stored anywhere.** Copy `id` and `pem` into the function's env vars
-   and redeploy.
+   `pem` (→ `GITHUB_APP_PRIVATE_KEY`), `client_id` (→ `GITHUB_APP_CLIENT_ID`),
+   `client_secret` (→ `GITHUB_APP_CLIENT_SECRET`), `webhook_secret`.
+   **This is the only time they're ever shown - nothing is stored
+   anywhere.** Copy what you need into the function's env vars and
+   redeploy.
 
 Then, once the App is installed on the org (GitHub prompts for this as
 part of app creation, or install it manually from the App's settings
@@ -120,13 +145,48 @@ created - not a compromise of anything of yours. `/app`'s exposure is
 real, though: it performs privileged repo operations across your org using
 credentials the caller never has to prove they should have access to,
 gated only by `APP_ROUTER_SECRET`. If this function is deployed with
-`--allow-unauthenticated` (needed for `/github`, `/docs`, and `/healthz`
-to be reachable at all), that shared secret is the only thing standing
-between the internet and `/app` - there's no IAM-level way to protect just
-one router within a single Cloud Function. Consider whether `/app` and
-`/setup` belong in a separate, more tightly-scoped deployment instead of
-alongside the public-facing routes, if that risk doesn't sit well with
-your threat model.
+`--allow-unauthenticated` (needed for `/github`, `/docs`, `/login`, and
+`/healthz` to be reachable at all), that shared secret is the only thing
+standing between the internet and `/app` - there's no IAM-level way to
+protect just one router within a single Cloud Function. Consider whether
+`/app` and `/setup` belong in a separate, more tightly-scoped deployment
+instead of alongside the public-facing routes, if that risk doesn't sit
+well with your threat model. `/login` is meant to be public - see below.
+
+## Self-serve login (`/login`)
+
+The alternative to `/app` for actual end users. Flow:
+
+1. **`GET /login`** renders a page with two links: "Log in with GitHub"
+   (GitHub's OAuth authorize URL) and "Install the GitHub App"
+   (`github.com/apps/<slug>/installations/new`). Before rendering, it sets
+   a random `state` value in a short-lived `HttpOnly` cookie
+   (`SameSite=Lax`, 5 minute expiry) and embeds the same value in the
+   authorize URL.
+2. The user logs into GitHub and authorizes. GitHub redirects to
+   **`GET /login/callback?code=...&state=...`**.
+3. The callback checks `state` against the cookie (CSRF protection - this
+   is the standard reason OAuth flows carry a `state` param; without it, a
+   redirect to this callback could be triggered by anyone, not just a
+   flow this server actually started), then exchanges `code` for the
+   user's own access token via `github.com/login/oauth/access_token` -
+   the one step that has to be server-side, since it needs
+   `GITHUB_APP_CLIENT_SECRET`.
+4. The token comes back via a redirect to `/login#access_token=...` - the
+   URL *fragment*, not a query string, so it's never sent to any server or
+   captured in logs. `/login`'s inline script reads `location.hash` on
+   load and displays it.
+
+That token is an ordinary GitHub personal-style access token from that
+point on - scoped to whatever the user can do, further bounded by
+wherever the app is installed. It's used directly against `/github`;
+there's no separate "authenticated user" API surface, because `/github`
+already accepts any caller-supplied token regardless of how the caller
+got it.
+
+`SameSite=Lax` on the state cookie is required, not just a reasonable
+default - `Strict` would drop the cookie on the top-level navigation back
+from `github.com`, breaking the state comparison on every login.
 
 ## Layered auth in `index.js`
 
@@ -140,20 +200,20 @@ only place that does, and it's what injects `lazyCreateOctokit` /
 places: the middleware knows *how* to attach an Octokit client to the
 request, `index.js` decides *which* one.
 
-`githubRouter` and `appRouter` are both built with `NewEmptyRouter()` from
-`simple-router-builder` — a thin wrapper around the standalone `router`
-package (the same routing engine Express's own `Router` is built on), not
-`express.Router()`. This project has no direct dependency on `express` at
-all.
+`githubRouter`, `appRouter`, and `loginRouter` are all built with
+`NewEmptyRouter()` from `simple-router-builder` — a thin wrapper around
+the standalone `router` package (the same routing engine Express's own
+`Router` is built on), not `express.Router()`. This project has no direct
+dependency on `express` at all.
 
-That still works with `res.json`/`res.status`/`res.locals`/`req.query`/`req.body`
+That still works with `res.json`/`res.status`/`res.redirect`/`res.locals`/`req.query`/`req.body`
 because `@google-cloud/functions-framework` (run via `npx`, see below)
 wraps everything in its own Express app *before* calling `Main` — it parses
 the request body itself (json/urlencoded/raw/text, by content-type) and
 attaches the full Express `req`/`res` prototype ahead of time. So by the
 time a request reaches a router, `req.body` is already populated, `res.locals`
-is already an object, and `res.json` already exists — the routers just need
-to route.
+is already an object, and `res.json`/`res.redirect` already exist — the
+routers just need to route.
 
 Data a middleware computes for downstream handlers — the Octokit client,
 the parsed upload files — lives on `res.locals` (`res.locals.octokit`,
@@ -172,16 +232,17 @@ complete as of this writing. `GET /docs/openapi.json` serves the raw
 document (`openapi.json` at the repo root) for any other tool that wants
 to consume it directly (Postman, Insomnia, codegen, etc.).
 
-The spec documents every route below, including `/app` and `/setup`,
-request/response schemas, both security schemes (`githubToken` for
-`/github`, `accessSecret` for `/app`), and worked examples.
+The spec documents every route below, including `/app`, `/setup`, and
+`/login`, request/response schemas, both security schemes (`githubToken`
+for `/github`, `accessSecret` for `/app`), and worked examples.
 
 ## Health check
 
 There's no dedicated health router — `GET /healthz` is answered directly by
 the `SimpleRouterBuilder` root handler in `index.js` with `{ "status": "ok" }`.
 Any other request that doesn't match `/github/...`, `/app/...`, `/setup/...`,
-`/docs`, or `/healthz` gets a plain 404 from that same root handler.
+`/login/...`, `/docs`, or `/healthz` gets a plain 404 from that same root
+handler.
 
 ## Object model
 
@@ -217,10 +278,10 @@ npm install
 npm run dev   # npx @google-cloud/functions-framework --target=Main --port=8080
 ```
 
-Then open `http://localhost:8080/docs` for the API reference. `/app` and
-`/setup` will error clearly (not silently misbehave) until their required
-env vars above are set - `/github`, `/docs`, and `/healthz` need no
-configuration at all.
+Then open `http://localhost:8080/docs` for the API reference. `/app`,
+`/setup`, and `/login` will error clearly (not silently misbehave) until
+their required env vars above are set - `/github`, `/docs`, and `/healthz`
+need no configuration at all.
 
 ## Routes (mounted under `/github`)
 
@@ -292,22 +353,32 @@ instead of a GitHub token.
 | GET | `/callback` | `?code=...` (from GitHub's redirect) | Exchange the code for the new App's credentials (shown once) |
 | GET | `/installations` | — | List this App's installations, to find `GITHUB_APP_INSTALLATION_ID` |
 
+## Routes (mounted under `/login` — see "Self-serve login" above)
+
+| Method | Path | Query | Description |
+| --- | --- | --- | --- |
+| GET | `/` | — | Login page: "log in with GitHub" and "install the app" links |
+| GET | `/callback` | `?code=...&state=...` (from GitHub's redirect) | Exchange the code for the user's own token, redirect back to `/login#access_token=...` |
+
 ## Notes
 
 - `simple-router-builder` isn't published to the npm registry, so `package.json`
   pulls it directly from source: `"simple-router-builder": "github:dash-xd/simple-router-builder#main"`.
   `npm install` needs read access to that repo.
 - Routing uses `simple-router-builder`'s `NewEmptyRouter()` end to end — this
-  project doesn't depend on `express` at all. `req.body`/`req.query`/`res.json`/`res.locals`
+  project doesn't depend on `express` at all. `req.body`/`req.query`/`res.json`/`res.redirect`/`res.locals`
   still work because `@google-cloud/functions-framework` supplies them via its
   own internal Express app before `Main` is ever invoked.
 - Octokit clients for `/github` are cached per Bearer token in a
-  module-scope `Map` (`octokits` in `index.js`); the `/app` Octokit is a
-  single instance built once. Both live only as long as the warm container
-  does.
+  module-scope `Map` (`octokits` in `index.js`); the `/app` Octokit and
+  `/login`'s app slug lookup are each a single cached instance/value. All
+  live only as long as the warm container does.
 - `@octokit/rest` is pinned to `^20` and `@octokit/auth-app` to `^6`
   because later major versions are ESM-only and this project uses
   CommonJS (`require`), matching the Cloud Functions entry point convention.
+  `/login`'s OAuth token exchange uses Node's built-in `fetch` (stable
+  since Node 18, matching this project's `engines.node` and the deployed
+  `nodejs22` runtime) rather than adding another dependency.
 - `openapi.json` uses a couple of genuine OpenAPI 3.2.0 additions where they
   fit naturally: the top-level `$self` field for document identity, and the
   new `Tag.summary` field. It doesn't reach for 3.2 features that don't
