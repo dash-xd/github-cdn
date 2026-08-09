@@ -6,7 +6,7 @@ const { createOctokit } = require("./src/lib/client.js");
 const { createInstallationOctokit } = require("./src/lib/app-client.js");
 const { githubAuth } = require("./src/middleware/github-auth.js");
 const { appAuth } = require("./src/middleware/app-auth.js");
-const { requireAccessSecret } = require("./src/middleware/access-secret.js");
+const { requireAppAccess } = require("./src/middleware/app-access.js");
 const { parseUpload } = require("./src/middleware/upload.js");
 const {
     createRepoHandler,
@@ -59,6 +59,13 @@ function getInstallationOctokit() {
     return installationOctokit;
 }
 
+function trustedGcpInvokerEmails() {
+    return (process.env.TRUSTED_GCP_INVOKER_EMAILS || "")
+        .split(",")
+        .map((email) => email.trim())
+        .filter(Boolean);
+}
+
 // Every route here runs as whatever the caller's own token can do -
 // personal or org, scoped however the token is scoped. createOrgRepoHandler
 // is included alongside createRepoHandler for that reason: org-owned repo
@@ -77,20 +84,31 @@ const githubRouter = NewEmptyRouter()
     .use(handleError)
 
 // Authenticates as the app installation itself (no caller-supplied GitHub
-// token), so it needs its own gate in place of one: requireAccessSecret
-// checks a server-configured shared secret instead. Every route here
-// reuses the exact same handlers as githubRouter above - they only ever
-// touch res.locals.octokit, so they don't care whether it was built from
-// a caller's PAT or an installation token.
+// token), so it needs its own gate in place of one: requireAppAccess
+// authorizes the *call* via whichever strategy the deployment has
+// configured - a trusted GCP caller identity (e.g. a WIF-authenticated
+// GitHub Actions job, no shared secret required at all), a static shared
+// secret (APP_ACCESS_SECRET), or both. See README "Calling this from
+// automation" and requireAppAccess's own comments in app-access.js for
+// why this is deliberately pluggable rather than one fixed mechanism.
+//
+// Every route here reuses the exact same handlers as githubRouter above -
+// they only ever touch res.locals.octokit, so they don't care whether it
+// was built from a caller's PAT or an installation token.
 //
 // This is for no-human-present server automation (CI, cron, etc) that
 // doesn't want to manage its own GitHub credentials at all. It's not the
 // only automation path, though: a caller that already has its own PAT or
 // installation token (e.g. minted via a separate step in the same
-// workflow) can just call githubRouter above directly with it - see the
-// README section on calling this from a GitHub Action.
+// workflow) can just call githubRouter above directly with it.
 const appRouter = NewEmptyRouter()
-    .use(requireAccessSecret(() => process.env.APP_ACCESS_SECRET))
+    .use(
+        requireAppAccess({
+            getSecret: () => process.env.APP_ACCESS_SECRET,
+            getTrustedEmails: trustedGcpInvokerEmails,
+            getAudience: () => process.env.APP_IDENTITY_AUDIENCE || process.env.PUBLIC_BASE_URL
+        })
+    )
     .use(appAuth(getInstallationOctokit))
     .post("/repos/:org/:name", createOrgRepoHandler)
     .post("/repos/:owner/:repo/upload", parseUpload, uploadObjectsHandler)
