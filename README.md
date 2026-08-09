@@ -20,7 +20,7 @@ src/
     access-secret.js            requireAccessSecret(getSecret): gates /app with a shared secret, since there's no caller GitHub token to double as one
     upload.js                  parseUpload: busboy multipart parser + SHA-256 content addressing; writes res.locals.files, plus objectPath()
     github-repos.js            one middleware function per /github route (createRepoHandler, uploadObjectsHandler, ...) plus handleError
-    app-repos.js                 createOrgRepoHandler: the one /app route that can't reuse a github-repos.js handler
+    org-repos.js                createOrgRepoHandler: org-scoped repo creation, shared by /github (caller token) and /app (installation token)
     app-setup.js                 serveManifestForm / handleManifestCallback / listInstallationsHandler for /setup
     oauth-login.js               serveLoginPage / handleLoginCallback for /login - self-serve OAuth user-to-server login
     docs.js                    serveDocsPage / serveOpenApiDocument for /docs
@@ -34,34 +34,41 @@ router module.
 
 - **`/github`** — the caller brings their own GitHub personal access token
   (`Authorization: Bearer <token>`), forwarded straight through to Octokit.
-  Whoever holds the token is authorized for whatever that token can do.
+  Whoever holds the token is authorized for whatever that token can do -
+  personal or org, including org-owned repo creation, if the token is
+  scoped for it.
 - **`/app`** — the function authenticates to GitHub itself, as an
   installation of a GitHub App, using credentials configured on the
   function (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_INSTALLATION_ID`).
   No human is present in this flow at all - it's for server-to-server
-  automation (CI, cron, etc), not something an end user goes through.
+  automation (CI, cron, etc) that doesn't want to manage its own GitHub
+  credentials, not something an end user goes through.
 - **`/login`** — a human logs in with their own GitHub account (OAuth
   user-to-server) and gets back an ordinary GitHub token, which they then
   use at `/github`. This is the self-serve, multi-tenant path; `/app` is
   the no-user-present one. They're separate purposes, not one superseding
   the other.
 
-`/app` reuses every `github-repos.js` handler except repo creation - they
-only ever read `res.locals.octokit`, so they don't care whether it was
-built from a caller's PAT or an installation token. Repo creation is the
-one place that can't be shared: installation tokens have no "authenticated
+`/app` reuses every `github-repos.js` handler, including repo creation:
+`createOrgRepoHandler` (`src/middleware/org-repos.js`) only ever reads
+`res.locals.octokit`, so it doesn't care whether that Octokit was built
+from a caller's PAT or an installation token - it works identically from
+either router. It's not the same handler as `/github`'s *personal*
+`POST /repos/{name}`, though: installation tokens have no "authenticated
 user" the way a PAT does, so `POST /user/repos` isn't available to them -
-creating an org-owned repo has to go through `POST /orgs/{org}/repos`
-instead (`createOrgRepo` in `repo-service.js`), which is why `/app`'s
-create-repo route takes `:org` explicitly (`POST /app/repos/{org}/{name}`)
-instead of assuming "whoever the token belongs to" the way `/github`'s
-`POST /repos/{name}` does.
+org-owned repos always go through `POST /orgs/{org}/repos`
+(`createOrgRepo` in `repo-service.js`) instead, which is why the org route
+takes `:org` explicitly (`POST /repos/{org}/{name}`) rather than assuming
+"whoever the token belongs to". `/github` exposes both shapes side by
+side - `POST /github/repos/{name}` for a personal repo, `POST
+/github/repos/{org}/{name}` for an org-owned one - since a caller token
+might be good for either.
 
 Because `/app` has no caller-supplied token, it has no caller-side
 authorization either - authenticating to *GitHub* as the installation says
 nothing about who's allowed to *call this function*. `requireAccessSecret`
 is the substitute: every `/app` request must present a server-configured
-shared secret as `Authorization: Bearer <APP_ROUTER_SECRET>`. Treat that
+shared secret as `Authorization: Bearer <APP_ACCESS_SECRET>`. Treat that
 secret the same way you'd treat the GitHub App's own private key.
 
 `/login` doesn't have (or need) an equivalent gate: the OAuth token it
@@ -74,7 +81,7 @@ authorization boundary there, the same as any caller-supplied token at
 
 | Var | What |
 | --- | --- |
-| `APP_ROUTER_SECRET` | Shared secret gating `/app`. Generate something long and random; there's no other check standing between the internet and your org's repos on this router. |
+| `APP_ACCESS_SECRET` | Shared secret gating `/app`. Generate something long and random; there's no other check standing between the internet and your org's repos on this router. |
 | `GITHUB_APP_ID` | The App's numeric id. |
 | `GITHUB_APP_PRIVATE_KEY` | The App's PEM private key. `\n`-escaped values (common when env vars can't hold real newlines) are unescaped automatically. |
 | `GITHUB_APP_INSTALLATION_ID` | The installation id for your org. One installation per deployment - if the App is installed on multiple orgs, deploy separate function instances with different `GITHUB_APP_INSTALLATION_ID` values. |
@@ -97,6 +104,41 @@ to build the "install the app" link, `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY`
 (already required for `/app`) - it fetches the app's slug via JWT auth and
 caches it, rather than requiring yet another env var for something
 derivable from what's already configured.
+
+## Calling this from automation (e.g. a GitHub Action)
+
+This function is expected to be called by CI as much as by browsers - a
+GitHub Actions workflow authenticating to GCP via Workload Identity
+Federation (no JSON key involved) is a typical caller. That WIF setup
+only proves the caller's identity to *GCP* - whether that identity is
+even allowed to invoke this Cloud Function at all (its IAM invoker
+binding, `--allow-unauthenticated` or not) is a deployment-time decision,
+made independently of anything in this codebase.
+
+Once a request actually reaches this service, GCP identity means nothing
+to it - this service only understands GitHub credentials, and it isn't
+responsible for how a caller gets one. What it provides is limited to the
+"base" primitives: **Auth** (`/login`, for obtaining a token) and
+**Install** (`/setup`, and the install link `/login` renders, for getting
+the GitHub App set up on an org in the first place). Everything past that
+is left to the caller to figure out:
+
+- A workflow that already has a usable token (a PAT stored as a workflow
+  secret, or an installation token minted by some other step, e.g.
+  [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token))
+  can call `/github` directly with it - no interaction with this service's
+  auth endpoints needed at all.
+- A workflow with no token of its own, and no interest in managing one,
+  calls `/app` instead, authenticated with `APP_ACCESS_SECRET`.
+- `/login`'s interactive OAuth flow is the one path a headless workflow
+  *can't* drive itself (it requires a browser and a human to click
+  "authorize") - it's for a human to run once, with the resulting token
+  then stored wherever the automation reads its credentials from.
+
+The pattern is the same in every case: get a token from this service's
+own endpoints (or bring one you already have), then present that token on
+every subsequent call. This service never looks up or manages credentials
+on a caller's behalf beyond that one exchange.
 
 ## Bootstrapping a GitHub App (`/setup`)
 
@@ -144,14 +186,18 @@ redirect URL, which only shows *them* credentials for an app *they* just
 created - not a compromise of anything of yours. `/app`'s exposure is
 real, though: it performs privileged repo operations across your org using
 credentials the caller never has to prove they should have access to,
-gated only by `APP_ROUTER_SECRET`. If this function is deployed with
+gated only by `APP_ACCESS_SECRET`. If this function is deployed with
 `--allow-unauthenticated` (needed for `/github`, `/docs`, `/login`, and
 `/healthz` to be reachable at all), that shared secret is the only thing
 standing between the internet and `/app` - there's no IAM-level way to
 protect just one router within a single Cloud Function. Consider whether
 `/app` and `/setup` belong in a separate, more tightly-scoped deployment
 instead of alongside the public-facing routes, if that risk doesn't sit
-well with your threat model. `/login` is meant to be public - see below.
+well with your threat model - or, if this function's invoker IAM binding
+is already restricted to specific identities (rather than `allUsers`),
+that binding is doing real access control of its own and `APP_ACCESS_SECRET`
+becomes a second, redundant layer rather than the only one. `/login` is
+meant to be public - see below.
 
 ## Self-serve login (`/login`)
 
@@ -287,7 +333,8 @@ need no configuration at all.
 
 | Method | Path | Body / Query | Description |
 | --- | --- | --- | --- |
-| POST | `/repos/:name` | `{ private?: boolean }` | Create a repo named `<name>-<random8>` |
+| POST | `/repos/:name` | `{ private?: boolean }` | Create a repo named `<name>-<random8>` under the caller's own account |
+| POST | `/repos/:org/:name` | `{ private?: boolean }` | Create a repo named `<name>-<random8>` inside org `:org` (requires a token with org repo-creation rights) |
 | POST | `/repos/:owner/:repo/upload` | multipart form: one or more files, optional `branch` field | Store uploaded files as content-addressed objects, returns each object's id/path/metadata |
 | GET | `/repos/:owner/:repo/:branch` | `?content=true` to include base64 file content | Snapshot a branch's file tree without cloning |
 | DELETE | `/repos/:owner/:repo/:branch` | `{ paths: string[] }` or `{ objectIds: string[] }` (singular `path`/`objectId` also accepted) | Delete one or more objects in a single commit, by tree path or by object id |
@@ -300,6 +347,10 @@ need no configuration at all.
 POST /github/repos/my-app
 Authorization: Bearer ghp_xxx
 -> { "name": "my-app-a82f91cd", "owner": "...", "url": "...", "default_branch": "main" }
+
+POST /github/repos/my-org/my-app
+Authorization: Bearer ghp_xxx
+-> { "name": "my-app-a82f91cd", "owner": "my-org", "url": "...", "default_branch": "main" }
 
 curl -H "Authorization: Bearer TOKEN" \
      -F "file=@example.tar.gz" -F "branch=main" \
@@ -335,14 +386,14 @@ POST /github/repos/user/my-app-a82f91cd/branches/from
 
 | Method | Path | Body / Query | Description |
 | --- | --- | --- | --- |
-| POST | `/repos/:org/:name` | `{ private?: boolean }` | Create a repo named `<name>-<random8>` inside `:org` |
+| POST | `/repos/:org/:name` | `{ private?: boolean }` | Create a repo named `<name>-<random8>` inside `:org` (same handler as `/github`'s org-repo route) |
 | POST | `/repos/:owner/:repo/upload` | same as `/github` | Same handler as `/github`'s upload route |
 | GET | `/repos/:owner/:repo/:branch` | same as `/github` | Same handler as `/github`'s snapshot route |
 | DELETE | `/repos/:owner/:repo/:branch` | same as `/github` | Same handler as `/github`'s delete route |
 | POST | `/repos/:owner/:repo/branches` | same as `/github` | Same handler as `/github`'s create-empty-branch route |
 | POST | `/repos/:owner/:repo/branches/from` | same as `/github` | Same handler as `/github`'s branch-from route |
 
-Every `/app` request needs `Authorization: Bearer <APP_ROUTER_SECRET>`
+Every `/app` request needs `Authorization: Bearer <APP_ACCESS_SECRET>`
 instead of a GitHub token.
 
 ## Routes (mounted under `/setup` — see "Bootstrapping a GitHub App" above)
