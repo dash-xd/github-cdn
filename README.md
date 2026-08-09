@@ -17,7 +17,7 @@ src/
   middleware/
     github-auth.js             githubAuth(createOctokit): returns a middleware that builds res.locals.octokit from the request's Bearer token
     app-auth.js                 appAuth(getInstallationOctokit): returns a middleware that builds res.locals.octokit as the app installation - no per-request token
-    access-secret.js            requireAccessSecret(getSecret): gates /app with a shared secret, since there's no caller GitHub token to double as one
+    app-access.js                requireAppAccess({...}): authorizes /app calls via a trusted GCP caller identity (WIF), a shared secret, or both - see "Calling this from automation" below
     upload.js                  parseUpload: busboy multipart parser + SHA-256 content addressing; writes res.locals.files, plus objectPath()
     github-repos.js            one middleware function per /github route (createRepoHandler, uploadObjectsHandler, ...) plus handleError
     org-repos.js                createOrgRepoHandler: org-scoped repo creation, shared by /github (caller token) and /app (installation token)
@@ -42,7 +42,9 @@ router module.
   function (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_INSTALLATION_ID`).
   No human is present in this flow at all - it's for server-to-server
   automation (CI, cron, etc) that doesn't want to manage its own GitHub
-  credentials, not something an end user goes through.
+  credentials, not something an end user goes through. *Calling* `/app`
+  itself is authorized by whichever strategy the deployment configures -
+  a trusted GCP caller identity, a shared secret, or both; see below.
 - **`/login`** — a human logs in with their own GitHub account (OAuth
   user-to-server) and gets back an ordinary GitHub token, which they then
   use at `/github`. This is the self-serve, multi-tenant path; `/app` is
@@ -66,10 +68,36 @@ might be good for either.
 
 Because `/app` has no caller-supplied token, it has no caller-side
 authorization either - authenticating to *GitHub* as the installation says
-nothing about who's allowed to *call this function*. `requireAccessSecret`
-is the substitute: every `/app` request must present a server-configured
-shared secret as `Authorization: Bearer <APP_ACCESS_SECRET>`. Treat that
-secret the same way you'd treat the GitHub App's own private key.
+nothing about who's allowed to *call this function*. `requireAppAccess`
+(`src/middleware/app-access.js`) is the substitute, and it isn't one fixed
+mechanism - it's a set of independent strategies, any one of which
+authorizes a request:
+
+- **A trusted GCP caller identity.** The bearer token is a Google-signed
+  OIDC identity token, verified against Google's own public keys (via
+  `google-auth-library`, not anything this service stores) rather than
+  compared against a secret this service holds. If the token's `email`
+  claim is in `TRUSTED_GCP_INVOKER_EMAILS` and its audience matches this
+  deployment, the request is authorized. This is what a caller that
+  already has a GCP identity - a Workload Identity Federation-
+  authenticated GitHub Actions job being the common case - presents; see
+  "Calling this from automation" below for how to mint that token.
+  **Nothing needs to be generated, stored, or rotated by this service for
+  a caller using this path** - the whole point of WIF is that the caller
+  already proved who it is to GCP some other way.
+- **A static shared secret.** `Authorization: Bearer <APP_ACCESS_SECRET>`,
+  checked with a constant-time comparison. For callers with no GCP
+  identity of their own to present. Treat it the same way you'd treat the
+  GitHub App's own private key.
+
+A deployment enables whichever strategy fits a given caller by setting
+that strategy's env vars - both can be enabled at once for a mix of
+callers, and leaving both unconfigured makes `/app` unreachable (500)
+rather than silently open. This is deliberately pluggable rather than
+"the one mechanism this project picked": different deployments, and
+different callers of the *same* deployment, have different existing
+identity systems, and `/app`'s job is to authorize the call, not to
+mandate how a caller proves who it is.
 
 `/login` doesn't have (or need) an equivalent gate: the OAuth token it
 hands back is scoped to whatever the logged-in user can personally do,
@@ -79,12 +107,19 @@ authorization boundary there, the same as any caller-supplied token at
 
 ### Required env vars for `/app`
 
+`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_INSTALLATION_ID`
+are always required - they're how `/app` authenticates *to GitHub*. Of
+the two authorization strategies below (how `/app` decides whether to
+accept the *call* at all), configure at least one - both is fine too:
+
 | Var | What |
 | --- | --- |
-| `APP_ACCESS_SECRET` | Shared secret gating `/app`. Generate something long and random; there's no other check standing between the internet and your org's repos on this router. |
 | `GITHUB_APP_ID` | The App's numeric id. |
 | `GITHUB_APP_PRIVATE_KEY` | The App's PEM private key. `\n`-escaped values (common when env vars can't hold real newlines) are unescaped automatically. |
 | `GITHUB_APP_INSTALLATION_ID` | The installation id for your org. One installation per deployment - if the App is installed on multiple orgs, deploy separate function instances with different `GITHUB_APP_INSTALLATION_ID` values. |
+| `TRUSTED_GCP_INVOKER_EMAILS` | Comma-separated GCP service account emails to trust via the identity-token strategy. Typically the WIF-impersonated service account your automation already authenticates as. |
+| `APP_IDENTITY_AUDIENCE` | Audience the identity token must be minted for. Defaults to `PUBLIC_BASE_URL` if unset - only set this separately if the two need to differ. |
+| `APP_ACCESS_SECRET` | Shared secret for the fallback strategy. Generate something long and random if you set it. |
 
 The installation `Octokit` is built once (lazily, on first request that
 needs it) and reused for the life of the warm container -
@@ -107,38 +142,59 @@ derivable from what's already configured.
 
 ## Calling this from automation (e.g. a GitHub Action)
 
-This function is expected to be called by CI as much as by browsers - a
-GitHub Actions workflow authenticating to GCP via Workload Identity
-Federation (no JSON key involved) is a typical caller. That WIF setup
-only proves the caller's identity to *GCP* - whether that identity is
-even allowed to invoke this Cloud Function at all (its IAM invoker
-binding, `--allow-unauthenticated` or not) is a deployment-time decision,
-made independently of anything in this codebase.
+This function is expected to be called by CI as much as by browsers, and
+different callers reasonably want different things from it:
 
-Once a request actually reaches this service, GCP identity means nothing
-to it - this service only understands GitHub credentials, and it isn't
-responsible for how a caller gets one. What it provides is limited to the
-"base" primitives: **Auth** (`/login`, for obtaining a token) and
-**Install** (`/setup`, and the install link `/login` renders, for getting
-the GitHub App set up on an org in the first place). Everything past that
-is left to the caller to figure out:
-
-- A workflow that already has a usable token (a PAT stored as a workflow
-  secret, or an installation token minted by some other step, e.g.
-  [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token))
-  can call `/github` directly with it - no interaction with this service's
-  auth endpoints needed at all.
-- A workflow with no token of its own, and no interest in managing one,
-  calls `/app` instead, authenticated with `APP_ACCESS_SECRET`.
+- A workflow that already has a usable GitHub token (a PAT stored as a
+  workflow secret, or an installation token minted by some other step,
+  e.g. [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token))
+  can call `/github` directly with it - no interaction with this
+  service's auth endpoints needed at all, and nothing below applies to it.
+- A workflow with no GitHub token of its own, and no interest in
+  managing one, wants `/app` - the function acts as the installed GitHub
+  App on its behalf. That's the case this section is about.
 - `/login`'s interactive OAuth flow is the one path a headless workflow
   *can't* drive itself (it requires a browser and a human to click
   "authorize") - it's for a human to run once, with the resulting token
   then stored wherever the automation reads its credentials from.
 
-The pattern is the same in every case: get a token from this service's
-own endpoints (or bring one you already have), then present that token on
-every subsequent call. This service never looks up or manages credentials
-on a caller's behalf beyond that one exchange.
+For the `/app` case: if your automation already authenticates to GCP via
+Workload Identity Federation - a GitHub Actions job using
+`google-github-actions/auth`, for instance - it already *has* a GCP
+identity, and that's enough to authorize `/app` on its own, with no
+separate secret to provision. WIF proves the workflow's identity to GCP;
+the same auth step can also mint a Google-signed OIDC *identity token*
+for that same service account, and `/app` verifies that token itself
+(see `requireAppAccess` above) rather than requiring anything else:
+
+```yaml
+- uses: google-github-actions/auth@v2
+  id: auth
+  with:
+    workload_identity_provider: ${{ vars.GCLOUD_WIF_PROVIDER }}
+    service_account: ${{ vars.GCLOUD_SERVICE_ACCOUNT }}
+    id_token_audience: ${{ vars.GITHUB_CDN_URL }}
+    id_token_include_email: true
+
+- run: |
+    curl -H "Authorization: Bearer ${{ steps.auth.outputs.id_token }}" \
+         -X POST "${{ vars.GITHUB_CDN_URL }}/app/repos/my-org/my-app"
+```
+
+Deploy with `TRUSTED_GCP_INVOKER_EMAILS` set to that service account's
+email and `APP_IDENTITY_AUDIENCE` (or `PUBLIC_BASE_URL`) matching
+`id_token_audience` above, and no `APP_ACCESS_SECRET` is needed at all
+for this caller. `APP_ACCESS_SECRET` still exists for callers with no GCP
+identity to present - set it too (or instead) if you have those; the two
+strategies aren't mutually exclusive, and which one(s) you enable is a
+deployment choice, not something hardcoded here.
+
+This is also the underlying reason `/app` and `/github` are separate
+routers rather than one router with conditional behavior: GCP identity
+verification only makes sense for `/app`'s "acting as the app" case.
+`/github` has no equivalent need for it - a caller there already proves
+itself via the GitHub token it brings, independent of how it got that
+token or what, if anything, authenticated it to GCP.
 
 ## Bootstrapping a GitHub App (`/setup`)
 
@@ -186,18 +242,17 @@ redirect URL, which only shows *them* credentials for an app *they* just
 created - not a compromise of anything of yours. `/app`'s exposure is
 real, though: it performs privileged repo operations across your org using
 credentials the caller never has to prove they should have access to,
-gated only by `APP_ACCESS_SECRET`. If this function is deployed with
-`--allow-unauthenticated` (needed for `/github`, `/docs`, `/login`, and
-`/healthz` to be reachable at all), that shared secret is the only thing
-standing between the internet and `/app` - there's no IAM-level way to
-protect just one router within a single Cloud Function. Consider whether
-`/app` and `/setup` belong in a separate, more tightly-scoped deployment
-instead of alongside the public-facing routes, if that risk doesn't sit
-well with your threat model - or, if this function's invoker IAM binding
-is already restricted to specific identities (rather than `allUsers`),
-that binding is doing real access control of its own and `APP_ACCESS_SECRET`
-becomes a second, redundant layer rather than the only one. `/login` is
-meant to be public - see below.
+authorized only by whatever `requireAppAccess` strategy you've configured
+(see "Calling this from automation" above). If this function is deployed
+with `--allow-unauthenticated` (needed for `/github`, `/docs`, `/login`,
+and `/healthz` to be reachable at all), that in-app check is the only
+thing standing between the internet and `/app` - there's no IAM-level way
+to protect just one router within a single Cloud Function, so a
+misconfigured or absent `requireAppAccess` strategy is a real exposure,
+not a theoretical one. Consider whether `/app` and `/setup` belong in a
+separate, more tightly-scoped deployment instead of alongside the
+public-facing routes, if that risk doesn't sit well with your threat
+model. `/login` is meant to be public - see below.
 
 ## Self-serve login (`/login`)
 
@@ -279,8 +334,9 @@ document (`openapi.json` at the repo root) for any other tool that wants
 to consume it directly (Postman, Insomnia, codegen, etc.).
 
 The spec documents every route below, including `/app`, `/setup`, and
-`/login`, request/response schemas, both security schemes (`githubToken`
-for `/github`, `accessSecret` for `/app`), and worked examples.
+`/login`, request/response schemas, all three security schemes
+(`githubToken` for `/github`; `accessSecret` and `gcpIdentityToken` for
+`/app`, either of which satisfies it), and worked examples.
 
 ## Health check
 
@@ -393,8 +449,9 @@ POST /github/repos/user/my-app-a82f91cd/branches/from
 | POST | `/repos/:owner/:repo/branches` | same as `/github` | Same handler as `/github`'s create-empty-branch route |
 | POST | `/repos/:owner/:repo/branches/from` | same as `/github` | Same handler as `/github`'s branch-from route |
 
-Every `/app` request needs `Authorization: Bearer <APP_ACCESS_SECRET>`
-instead of a GitHub token.
+Every `/app` request needs `Authorization: Bearer <token>`, where `token`
+is either a Google-signed identity token for a `TRUSTED_GCP_INVOKER_EMAILS`
+entry, or `APP_ACCESS_SECRET` - see "Calling this from automation" above.
 
 ## Routes (mounted under `/setup` — see "Bootstrapping a GitHub App" above)
 
@@ -430,6 +487,12 @@ instead of a GitHub token.
   `/login`'s OAuth token exchange uses Node's built-in `fetch` (stable
   since Node 18, matching this project's `engines.node` and the deployed
   `nodejs22` runtime) rather than adding another dependency.
+- `google-auth-library` is used only by `/app`'s GCP-identity-token
+  strategy (`src/middleware/app-access.js`), to verify a caller-presented
+  identity token against Google's own keys. It's the standard library for
+  this on Node, and the same one Google's own Cloud Run/Functions
+  authentication docs point to for verifying identity tokens
+  application-side.
 - `openapi.json` uses a couple of genuine OpenAPI 3.2.0 additions where they
   fit naturally: the top-level `$self` field for document identity, and the
   new `Tag.summary` field. It doesn't reach for 3.2 features that don't
