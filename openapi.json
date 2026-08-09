@@ -33,7 +33,13 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "Shared secret (APP_ACCESS_SECRET)",
-        "description": "Sent as `Authorization: Bearer <secret>`. /app authenticates to GitHub as the app installation itself, so there's no caller-supplied GitHub token to double as authorization the way there is for /github - this shared secret is the substitute."
+        "description": "Sent as `Authorization: Bearer <secret>`. One of two ways to authorize /app (see gcpIdentityToken for the other) - either alone satisfies it. For callers with no GCP identity of their own to present."
+      },
+      "gcpIdentityToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "Google-signed OIDC identity token",
+        "description": "Sent as `Authorization: Bearer <token>`. The other way to authorize /app: a Google-signed identity token for a service account listed in TRUSTED_GCP_INVOKER_EMAILS, audienced to this deployment, verified against Google's own keys. This is what a Workload Identity Federation-authenticated caller (e.g. a GitHub Actions job) presents - no separate secret needed for that caller. See the README's 'Calling this from automation' section for how to mint one."
       }
     },
     "parameters": {
@@ -484,7 +490,7 @@
         "summary": "Create a repository in an org, as the app",
         "description": "Identical behavior to POST /github/repos/{org}/{name} - same handler, different auth. Installation tokens have no \"authenticated user\" to create a personal repo under, so this is the only repo-creation shape available on /app.",
         "tags": ["App"],
-        "security": [{ "accessSecret": [] }],
+        "security": [{ "accessSecret": [] }, { "gcpIdentityToken": [] }],
         "parameters": [
           { "name": "org", "in": "path", "required": true, "schema": { "type": "string" }, "example": "dash-xd" },
           { "name": "name", "in": "path", "required": true, "schema": { "type": "string" }, "example": "my-app" }
@@ -517,7 +523,7 @@
         "summary": "Upload files as content-addressed objects, as the app",
         "description": "Identical behavior to POST /github/repos/{owner}/{repo}/upload - same handler, different auth.",
         "tags": ["App"],
-        "security": [{ "accessSecret": [] }],
+        "security": [{ "accessSecret": [] }, { "gcpIdentityToken": [] }],
         "parameters": [
           { "$ref": "#/components/parameters/owner" },
           { "$ref": "#/components/parameters/repo" },
@@ -565,7 +571,7 @@
         "summary": "Snapshot a branch without cloning, as the app",
         "description": "Identical behavior to GET /github/repos/{owner}/{repo}/{branch} - same handler, different auth.",
         "tags": ["App"],
-        "security": [{ "accessSecret": [] }],
+        "security": [{ "accessSecret": [] }, { "gcpIdentityToken": [] }],
         "parameters": [
           { "$ref": "#/components/parameters/owner" },
           { "$ref": "#/components/parameters/repo" },
@@ -594,7 +600,7 @@
         "summary": "Delete one or more objects, as the app",
         "description": "Identical behavior to DELETE /github/repos/{owner}/{repo}/{branch} - same handler, different auth.",
         "tags": ["App"],
-        "security": [{ "accessSecret": [] }],
+        "security": [{ "accessSecret": [] }, { "gcpIdentityToken": [] }],
         "parameters": [
           { "$ref": "#/components/parameters/owner" },
           { "$ref": "#/components/parameters/repo" },
@@ -632,7 +638,7 @@
         "summary": "Create a new empty branch, as the app",
         "description": "Identical behavior to POST /github/repos/{owner}/{repo}/branches - same handler, different auth.",
         "tags": ["App"],
-        "security": [{ "accessSecret": [] }],
+        "security": [{ "accessSecret": [] }, { "gcpIdentityToken": [] }],
         "parameters": [
           { "$ref": "#/components/parameters/owner" },
           { "$ref": "#/components/parameters/repo" }
@@ -665,7 +671,7 @@
         "summary": "Create a branch from an existing branch, as the app",
         "description": "Identical behavior to POST /github/repos/{owner}/{repo}/branches/from - same handler, different auth.",
         "tags": ["App"],
-        "security": [{ "accessSecret": [] }],
+        "security": [{ "accessSecret": [] }, { "gcpIdentityToken": [] }],
         "parameters": [
           { "$ref": "#/components/parameters/owner" },
           { "$ref": "#/components/parameters/repo" }
