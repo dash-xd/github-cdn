@@ -67,8 +67,11 @@ function serveManifestForm(req, res) {
 // is single-use and short-lived; exchanging it for the app's credentials
 // needs no auth of its own (the code is the credential). This response is
 // the only place those credentials are ever surfaced - copy them into
-// GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY and redeploy, then use
-// GET /setup/installations to find GITHUB_APP_INSTALLATION_ID.
+// GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY and redeploy, then install the
+// app on whichever orgs/accounts should be able to use /app.
+// GET /setup/installations lists them, informationally - /app itself
+// resolves the right installation per request, no installation id needs
+// to be configured anywhere (see index.js's resolveInstallationOctokit).
 async function handleManifestCallback(req, res, next) {
     try {
         const code = req.query.code;
@@ -88,7 +91,7 @@ async function handleManifestCallback(req, res, next) {
             webhook_secret: data.webhook_secret,
             pem: data.pem,
             html_url: data.html_url,
-            note: "One-time only - this is not stored anywhere. Set GITHUB_APP_ID=id, GITHUB_APP_PRIVATE_KEY=pem, install the app on your org if you haven't yet, then call GET /setup/installations to find GITHUB_APP_INSTALLATION_ID."
+            note: "One-time only - this is not stored anywhere. Set GITHUB_APP_ID=id and GITHUB_APP_PRIVATE_KEY=pem, then install the app on whichever orgs/accounts should be able to use /app. No installation id needs to be configured - /app resolves the right one per request. GET /setup/installations lists current installations."
         });
     } catch (err) {
         next(err);
@@ -96,10 +99,11 @@ async function handleManifestCallback(req, res, next) {
 }
 
 // GET /setup/installations
-// Lists installations of this app (app-level JWT auth only - no
-// installation id needed yet), so the operator can read off the right
-// GITHUB_APP_INSTALLATION_ID once GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY
-// are set.
+// Lists this app's current installations (app-level JWT auth only - no
+// installation id needed). Purely informational - useful for confirming
+// an install worked or auditing where the app has access - since /app
+// resolves the installation for a given request itself and doesn't read
+// this list or need any installation id configured.
 async function listInstallationsHandler(req, res, next) {
     try {
         const appId = process.env.GITHUB_APP_ID;

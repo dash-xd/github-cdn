@@ -3,7 +3,7 @@
 const { SimpleRouterBuilder, NewEmptyRouter } = require("simple-router-builder");
 
 const { createOctokit } = require("./src/lib/client.js");
-const { createInstallationOctokit } = require("./src/lib/app-client.js");
+const { createInstallationOctokit, createAppLevelOctokit } = require("./src/lib/app-client.js");
 const { githubAuth } = require("./src/middleware/github-auth.js");
 const { appAuth } = require("./src/middleware/app-auth.js");
 const { requireAppAccess } = require("./src/middleware/app-access.js");
@@ -33,30 +33,89 @@ function lazyCreateOctokit(token) {
     return octokit;
 }
 
-// A single installation Octokit, built once and reused: @octokit/auth-app
-// caches and refreshes the installation access token internally, so
-// there's no need to rebuild this per request the way lazyCreateOctokit
-// does for per-caller PATs above.
-let installationOctokit = null;
+function requireAppCredentials() {
+    const appId = process.env.GITHUB_APP_ID;
+    const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
 
-function getInstallationOctokit() {
-    if (!installationOctokit) {
-        const appId = process.env.GITHUB_APP_ID;
-        const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
-        const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
-
-        const missing = ["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_APP_INSTALLATION_ID"].filter(
-            (name) => !process.env[name]
-        );
-
-        if (missing.length > 0) {
-            throw new Error(`missing required env var(s): ${missing.join(", ")}`);
-        }
-
-        installationOctokit = createInstallationOctokit({ appId, privateKey, installationId });
+    const missing = ["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY"].filter((name) => !process.env[name]);
+    if (missing.length > 0) {
+        throw new Error(`missing required env var(s): ${missing.join(", ")}`);
     }
 
-    return installationOctokit;
+    return { appId, privateKey };
+}
+
+// App-level (JWT-only) Octokit, for looking up *which* installation
+// covers a given org/repo - there's no fixed installation id configured
+// anywhere, since this deployment isn't tied to just one. Built once and
+// reused: like the installation Octokits below, @octokit/auth-app mints
+// and refreshes the JWT internally.
+let appLevelOctokit = null;
+
+function getAppLevelOctokit() {
+    if (!appLevelOctokit) {
+        appLevelOctokit = createAppLevelOctokit(requireAppCredentials());
+    }
+    return appLevelOctokit;
+}
+
+// One Octokit per resolved installation id, not one global singleton:
+// @octokit/auth-app caches and auto-refreshes the installation access
+// token internally for whichever installation an Octokit instance was
+// built for, so - same as the per-caller-token cache above - there's no
+// need to rebuild it on every request, only once per *installation*
+// this deployment has actually seen. This is what makes /app multi-
+// tenant: an org or repo the App is installed on gets its own cached,
+// self-refreshing client the first time it's touched, instead of the
+// whole deployment being pinned to one installation chosen at deploy
+// time.
+const installationOctokits = new Map();
+
+function installationOctokitFor(installationId) {
+    let octokit = installationOctokits.get(installationId);
+    if (!octokit) {
+        octokit = createInstallationOctokit({ ...requireAppCredentials(), installationId });
+        installationOctokits.set(installationId, octokit);
+    }
+    return octokit;
+}
+
+// org/repo -> installation id, cached for the life of the warm container
+// (installations change rarely, and the failure mode if one is
+// uninstalled mid-cache-lifetime is just a GitHub API error on the next
+// call - not a security issue, since GitHub itself is still the one
+// deciding whether that installation can do anything).
+const installationIdByTarget = new Map();
+
+// Resolves which installation covers a request's target and returns an
+// Octokit authenticated as it. This is the actual authorization boundary
+// for *what* an already-authorized /app caller (see requireAppAccess) can
+// act on: GitHub's own API 404s here for any org/repo this App isn't
+// installed on, so passing requireAppAccess only ever grants the ability
+// to act as installations that genuinely exist - never an arbitrary org
+// a caller names.
+async function resolveInstallationOctokit(target) {
+    const cacheKey = target.org ? `org:${target.org}` : `repo:${target.owner}/${target.repo}`;
+
+    let installationId = installationIdByTarget.get(cacheKey);
+    if (!installationId) {
+        const octokit = getAppLevelOctokit();
+        const { data } = target.org
+            ? await octokit.rest.apps.getOrgInstallation({ org: target.org })
+            : await octokit.rest.apps.getRepoInstallation({ owner: target.owner, repo: target.repo });
+        installationId = data.id;
+        installationIdByTarget.set(cacheKey, installationId);
+    }
+
+    return installationOctokitFor(installationId);
+}
+
+function forOrg(req) {
+    return { org: req.params.org };
+}
+
+function forRepo(req) {
+    return { owner: req.params.owner, repo: req.params.repo };
 }
 
 function trustedGcpInvokerEmails() {
@@ -83,14 +142,21 @@ const githubRouter = NewEmptyRouter()
     .post("/repos/:owner/:repo/branches/from", createBranchFromHandler)
     .use(handleError)
 
-// Authenticates as the app installation itself (no caller-supplied GitHub
-// token), so it needs its own gate in place of one: requireAppAccess
+// Authenticates as a GitHub App installation itself (no caller-supplied
+// GitHub token), so it needs its own gate in place of one: requireAppAccess
 // authorizes the *call* via whichever strategy the deployment has
 // configured - a trusted GCP caller identity (e.g. a WIF-authenticated
 // GitHub Actions job, no shared secret required at all), a static shared
 // secret (APP_ACCESS_SECRET), or both. See README "Calling this from
-// automation" and requireAppAccess's own comments in app-access.js for
-// why this is deliberately pluggable rather than one fixed mechanism.
+// automation" for why this is deliberately pluggable rather than one
+// fixed mechanism.
+//
+// Passing that gate doesn't hand a caller the whole App, though: appAuth
+// is applied per route (not as one router-wide .use(), since it needs
+// req.params - see app-auth.js) and resolves the specific installation
+// that covers whatever org/repo the request names, via forOrg/forRepo
+// below. A caller can only ever act on orgs/repos this App is actually
+// installed on - see resolveInstallationOctokit's comment above.
 //
 // Every route here reuses the exact same handlers as githubRouter above -
 // they only ever touch res.locals.octokit, so they don't care whether it
@@ -109,13 +175,12 @@ const appRouter = NewEmptyRouter()
             getAudience: () => process.env.APP_IDENTITY_AUDIENCE || process.env.PUBLIC_BASE_URL
         })
     )
-    .use(appAuth(getInstallationOctokit))
-    .post("/repos/:org/:name", createOrgRepoHandler)
-    .post("/repos/:owner/:repo/upload", parseUpload, uploadObjectsHandler)
-    .get("/repos/:owner/:repo/:branch", getBranchSnapshotHandler)
-    .delete("/repos/:owner/:repo/:branch", deleteObjectsHandler)
-    .post("/repos/:owner/:repo/branches", createEmptyBranchHandler)
-    .post("/repos/:owner/:repo/branches/from", createBranchFromHandler)
+    .post("/repos/:org/:name", appAuth(forOrg, resolveInstallationOctokit), createOrgRepoHandler)
+    .post("/repos/:owner/:repo/upload", appAuth(forRepo, resolveInstallationOctokit), parseUpload, uploadObjectsHandler)
+    .get("/repos/:owner/:repo/:branch", appAuth(forRepo, resolveInstallationOctokit), getBranchSnapshotHandler)
+    .delete("/repos/:owner/:repo/:branch", appAuth(forRepo, resolveInstallationOctokit), deleteObjectsHandler)
+    .post("/repos/:owner/:repo/branches", appAuth(forRepo, resolveInstallationOctokit), createEmptyBranchHandler)
+    .post("/repos/:owner/:repo/branches/from", appAuth(forRepo, resolveInstallationOctokit), createBranchFromHandler)
     .use(handleError)
 
 // Bootstraps a GitHub App for an org when one doesn't exist yet, via
