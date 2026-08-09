@@ -17,7 +17,7 @@ const {
     createBranchFromHandler,
     handleError
 } = require("./src/middleware/github-repos.js");
-const { createOrgRepoHandler } = require("./src/middleware/app-repos.js");
+const { createOrgRepoHandler } = require("./src/middleware/org-repos.js");
 const { serveManifestForm, handleManifestCallback, listInstallationsHandler } = require("./src/middleware/app-setup.js");
 const { serveLoginPage, handleLoginCallback } = require("./src/middleware/oauth-login.js");
 const { serveOpenApiDocument, serveDocsPage } = require("./src/middleware/docs.js");
@@ -59,9 +59,16 @@ function getInstallationOctokit() {
     return installationOctokit;
 }
 
+// Every route here runs as whatever the caller's own token can do -
+// personal or org, scoped however the token is scoped. createOrgRepoHandler
+// is included alongside createRepoHandler for that reason: org-owned repo
+// creation isn't an "/app-only" capability, it's just a different GitHub
+// endpoint (POST /orgs/{org}/repos vs POST /user/repos) that any adequately-
+// scoped caller token can use too.
 const githubRouter = NewEmptyRouter()
     .use(githubAuth(lazyCreateOctokit))
     .post("/repos/:name", createRepoHandler)
+    .post("/repos/:org/:name", createOrgRepoHandler)
     .post("/repos/:owner/:repo/upload", parseUpload, uploadObjectsHandler)
     .get("/repos/:owner/:repo/:branch", getBranchSnapshotHandler)
     .delete("/repos/:owner/:repo/:branch", deleteObjectsHandler)
@@ -71,18 +78,19 @@ const githubRouter = NewEmptyRouter()
 
 // Authenticates as the app installation itself (no caller-supplied GitHub
 // token), so it needs its own gate in place of one: requireAccessSecret
-// checks a server-configured shared secret instead. Everything except
-// repo creation reuses the exact same handlers as githubRouter above -
-// they only ever touch res.locals.octokit, so they don't care whether it
-// was built from a caller's PAT or an installation token. Repo creation
-// doesn't reuse createRepoHandler: installation tokens can't call
-// POST /user/repos, so org-owned creation needs its own :org-scoped route.
+// checks a server-configured shared secret instead. Every route here
+// reuses the exact same handlers as githubRouter above - they only ever
+// touch res.locals.octokit, so they don't care whether it was built from
+// a caller's PAT or an installation token.
 //
-// This is for no-human-present server automation (CI, cron, etc). It's
-// not the multi-tenant self-serve path - see /login for that, which hands
-// users an ordinary GitHub token to use against /github instead.
+// This is for no-human-present server automation (CI, cron, etc) that
+// doesn't want to manage its own GitHub credentials at all. It's not the
+// only automation path, though: a caller that already has its own PAT or
+// installation token (e.g. minted via a separate step in the same
+// workflow) can just call githubRouter above directly with it - see the
+// README section on calling this from a GitHub Action.
 const appRouter = NewEmptyRouter()
-    .use(requireAccessSecret(() => process.env.APP_ROUTER_SECRET))
+    .use(requireAccessSecret(() => process.env.APP_ACCESS_SECRET))
     .use(appAuth(getInstallationOctokit))
     .post("/repos/:org/:name", createOrgRepoHandler)
     .post("/repos/:owner/:repo/upload", parseUpload, uploadObjectsHandler)
