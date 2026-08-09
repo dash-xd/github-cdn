@@ -32,7 +32,7 @@
       "accessSecret": {
         "type": "http",
         "scheme": "bearer",
-        "bearerFormat": "Shared secret (APP_ROUTER_SECRET)",
+        "bearerFormat": "Shared secret (APP_ACCESS_SECRET)",
         "description": "Sent as `Authorization: Bearer <secret>`. /app authenticates to GitHub as the app installation itself, so there's no caller-supplied GitHub token to double as authorization the way there is for /github - this shared secret is the substitute."
       }
     },
@@ -231,9 +231,41 @@
       "post": {
         "operationId": "createRepo",
         "summary": "Create a repository",
-        "description": "Creates a new GitHub repository named `<name>-<random8>`.",
+        "description": "Creates a new GitHub repository named `<name>-<random8>` under the caller's own account (POST /user/repos). For an org-owned repo, see POST /github/repos/{org}/{name} instead.",
         "tags": ["Repositories"],
         "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" }, "example": "my-app" }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "private": { "type": "boolean", "default": true }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Repository created.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Repo" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/github/repos/{org}/{name}": {
+      "post": {
+        "operationId": "createOrgRepo",
+        "summary": "Create a repository in an org",
+        "description": "Creates a new GitHub repository named `<name>-<random8>` inside `:org`, via POST /orgs/{org}/repos rather than POST /user/repos. Works with any caller token that has org repo-creation rights - not just installation tokens; see POST /app/repos/{org}/{name} for the installation-auth equivalent of this same handler.",
+        "tags": ["Repositories"],
+        "parameters": [
+          { "name": "org", "in": "path", "required": true, "schema": { "type": "string" }, "example": "dash-xd" },
           { "name": "name", "in": "path", "required": true, "schema": { "type": "string" }, "example": "my-app" }
         ],
         "requestBody": {
@@ -448,9 +480,9 @@
     },
     "/app/repos/{org}/{name}": {
       "post": {
-        "operationId": "createOrgRepo",
+        "operationId": "appCreateOrgRepo",
         "summary": "Create a repository in an org, as the app",
-        "description": "Like POST /github/repos/{name}, but authenticated as the app installation and scoped to an org: installation tokens have no \"authenticated user\" to create a personal repo under, so this goes through POST /orgs/{org}/repos instead.",
+        "description": "Identical behavior to POST /github/repos/{org}/{name} - same handler, different auth. Installation tokens have no \"authenticated user\" to create a personal repo under, so this is the only repo-creation shape available on /app.",
         "tags": ["App"],
         "security": [{ "accessSecret": [] }],
         "parameters": [
