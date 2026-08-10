@@ -202,7 +202,7 @@
       "Installation": {
         "type": "object",
         "properties": {
-          "installationId": { "type": "integer", "description": "GITHUB_APP_INSTALLATION_ID" },
+          "installationId": { "type": "integer", "description": "GitHub's installation id - informational only, not something you configure. /app resolves the right installation per request." },
           "account": { "type": "string" },
           "targetType": { "type": "string", "enum": ["Organization", "User"] }
         }
@@ -747,7 +747,7 @@
       "get": {
         "operationId": "listInstallations",
         "summary": "List this app's installations",
-        "description": "App-level (JWT) auth only, no installation id required - use this to find GITHUB_APP_INSTALLATION_ID once GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY are set.",
+        "description": "App-level (JWT) auth only. Purely informational (e.g. to confirm an install worked) - /app resolves the installation for a given request itself, per-request, so nothing here needs to be configured anywhere.",
         "tags": ["Setup"],
         "security": [],
         "responses": {
