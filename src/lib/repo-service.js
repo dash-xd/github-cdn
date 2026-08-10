@@ -28,11 +28,10 @@ async function getDefaultBranch(octokit, owner, repo) {
     return data.default_branch;
 }
 
-// Like createRepo, but for callers authenticated as a GitHub App
-// installation rather than a user. Installation tokens have no
-// "authenticated user" to create a repo under - POST /user/repos isn't
-// available to them - so org-owned repos have to go through
-// POST /orgs/{org}/repos instead.
+// Like createRepo, but org-owned: a personal access token creates under
+// the token owner's account (POST /user/repos), which has no equivalent
+// for "create this under an org I belong to" - that has to go through
+// POST /orgs/{org}/repos instead, with the org named explicitly.
 async function createOrgRepo(octokit, org, name, options = {}) {
     const repoName = `${sanitizeName(name)}-${randomUUID().slice(0, 8)}`;
 

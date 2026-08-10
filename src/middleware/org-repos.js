@@ -8,10 +8,7 @@ const { createOrgRepo } = require("../lib/repo-service.js");
 // way it is for every other route: a personal access token creates under
 // the token owner's account (POST /user/repos), but an org-owned repo
 // needs POST /orgs/{org}/repos (repos.createInOrg) with the org named
-// explicitly. Installation tokens have no "authenticated user" at all, so
-// for /app this is the *only* way to create a repo - but it works just as
-// well for /github, for any caller whose own token has org repo-creation
-// rights. Shared by both routers; only the auth in front of it differs.
+// explicitly.
 async function createOrgRepoHandler(req, res, next) {
     try {
         const repo = await createOrgRepo(res.locals.octokit, req.params.org, req.params.name, req.body || {});
