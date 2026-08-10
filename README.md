@@ -16,7 +16,7 @@ src/
     repo-service.js            GitHub Git Data API service layer (createRepo, createOrgRepo, commitFiles, getBranchSnapshot, deleteFiles, createEmptyBranch, createBranchFrom)
   middleware/
     github-auth.js             githubAuth(createOctokit): returns a middleware that builds res.locals.octokit from the request's Bearer token
-    app-auth.js                 appAuth(getInstallationOctokit): returns a middleware that builds res.locals.octokit as the app installation - no per-request token
+    app-auth.js                 appAuth(resolveTarget, resolveInstallationOctokit): returns a middleware that resolves and builds res.locals.octokit for whichever installation covers the request's target - see "Multi-tenant /app" below
     app-access.js                requireAppAccess({...}): authorizes /app calls via a trusted GCP caller identity (WIF), a shared secret, or both - see "Calling this from automation" below
     upload.js                  parseUpload: busboy multipart parser + SHA-256 content addressing; writes res.locals.files, plus objectPath()
     github-repos.js            one middleware function per /github route (createRepoHandler, uploadObjectsHandler, ...) plus handleError
@@ -37,14 +37,16 @@ router module.
   Whoever holds the token is authorized for whatever that token can do -
   personal or org, including org-owned repo creation, if the token is
   scoped for it.
-- **`/app`** — the function authenticates to GitHub itself, as an
-  installation of a GitHub App, using credentials configured on the
-  function (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_INSTALLATION_ID`).
-  No human is present in this flow at all - it's for server-to-server
-  automation (CI, cron, etc) that doesn't want to manage its own GitHub
-  credentials, not something an end user goes through. *Calling* `/app`
-  itself is authorized by whichever strategy the deployment configures -
-  a trusted GCP caller identity, a shared secret, or both; see below.
+- **`/app`** — the function authenticates to GitHub itself, as a GitHub
+  App installation, using credentials configured on the function
+  (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY`). No human is present in
+  this flow at all - it's for server-to-server automation (CI, cron, etc)
+  that doesn't want to manage its own GitHub credentials, not something
+  an end user goes through. *Which* installation it acts as is resolved
+  per request from the org/repo the request names, not fixed at deploy
+  time - see "Multi-tenant `/app`" below. *Calling* `/app` at all is
+  authorized by whichever strategy the deployment configures - a trusted
+  GCP caller identity, a shared secret, or both; see below.
 - **`/login`** — a human logs in with their own GitHub account (OAuth
   user-to-server) and gets back an ordinary GitHub token, which they then
   use at `/github`. This is the self-serve, multi-tenant path; `/app` is
@@ -105,26 +107,54 @@ further bounded by wherever the app is installed - GitHub itself is the
 authorization boundary there, the same as any caller-supplied token at
 `/github`. See "Self-serve login" below.
 
+## Multi-tenant `/app`
+
+Passing `requireAppAccess` authorizes a caller to use `/app` at all - it
+says nothing about *which* installation of the App that caller should act
+as, and the App may well be installed on more than one org or account.
+`appAuth` (`src/middleware/app-auth.js`) resolves that per request, from
+whatever org/repo the request names:
+
+- `POST /repos/{org}/{name}` (repo creation) resolves via
+  `GET /orgs/{org}/installation`.
+- Every other route names an existing `{owner}/{repo}`, so it resolves via
+  `GET /repos/{owner}/{repo}/installation`.
+
+Both are ordinary GitHub API calls made with an app-level (JWT) Octokit -
+the same mechanism `/setup/installations` uses to list installations, just
+looked up for one specific target instead of listed in full. **This is
+the actual authorization boundary for *what* an already-authorized caller
+can act on**: GitHub 404s that lookup for any org/repo this App isn't
+installed on, so passing `requireAppAccess` only ever grants the ability
+to act as installations that genuinely exist - never an arbitrary org a
+caller happens to name in the URL. A caller authorized via
+`TRUSTED_GCP_INVOKER_EMAILS` or `APP_ACCESS_SECRET` can use `/app` against
+*any* org/repo the App is installed on, not just one designated in
+advance - that's what makes this multi-tenant.
+
+Resolved installation ids, and the `Octokit` built for each, are both
+cached in module-scope `Map`s for the life of the warm container (see the
+comments in `index.js`) - so, same as the per-caller-token cache for
+`/github`, there's no repeated lookup or client rebuild on every request,
+just once per installation this deployment has actually been asked to act
+as. No installation id is configured anywhere; `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY` are the only credentials `/app` needs.
+
 ### Required env vars for `/app`
 
-`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_INSTALLATION_ID`
-are always required - they're how `/app` authenticates *to GitHub*. Of
-the two authorization strategies below (how `/app` decides whether to
-accept the *call* at all), configure at least one - both is fine too:
+`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` are always required - they're
+how `/app` authenticates *to GitHub* (see "Multi-tenant `/app`" above for
+how the installation itself is resolved). Of the two authorization
+strategies below (how `/app` decides whether to accept the *call* at
+all), configure at least one - both is fine too:
 
 | Var | What |
 | --- | --- |
 | `GITHUB_APP_ID` | The App's numeric id. |
 | `GITHUB_APP_PRIVATE_KEY` | The App's PEM private key. `\n`-escaped values (common when env vars can't hold real newlines) are unescaped automatically. |
-| `GITHUB_APP_INSTALLATION_ID` | The installation id for your org. One installation per deployment - if the App is installed on multiple orgs, deploy separate function instances with different `GITHUB_APP_INSTALLATION_ID` values. |
 | `TRUSTED_GCP_INVOKER_EMAILS` | Comma-separated GCP service account emails to trust via the identity-token strategy. Typically the WIF-impersonated service account your automation already authenticates as. |
 | `APP_IDENTITY_AUDIENCE` | Audience the identity token must be minted for. Defaults to `PUBLIC_BASE_URL` if unset - only set this separately if the two need to differ. |
 | `APP_ACCESS_SECRET` | Shared secret for the fallback strategy. Generate something long and random if you set it. |
-
-The installation `Octokit` is built once (lazily, on first request that
-needs it) and reused for the life of the warm container -
-`@octokit/auth-app` handles refreshing the installation token internally,
-so there's no need to rebuild the client per request.
 
 ### Required env vars for `/login`
 
@@ -221,11 +251,13 @@ Function. Three steps:
    anywhere.** Copy what you need into the function's env vars and
    redeploy.
 
-Then, once the App is installed on the org (GitHub prompts for this as
-part of app creation, or install it manually from the App's settings
-page): **`GET /setup/installations`** lists installations using app-level
-(JWT) auth - no installation id required yet - so you can read off the
-right `GITHUB_APP_INSTALLATION_ID`.
+Then install the App on whichever orgs/accounts should be able to use
+`/app` (GitHub prompts for this as part of app creation, or install it
+manually from the App's settings page any time after). No further
+configuration is needed per installation - `/app` resolves the right one
+per request (see "Multi-tenant `/app`" above). **`GET /setup/installations`**
+lists current installations, purely informationally (e.g. to confirm an
+install worked).
 
 The manifest requests `contents: write` and `metadata: read` on
 repositories, and `organization_administration: write` at the org level
@@ -292,14 +324,19 @@ from `github.com`, breaking the state comparison on every login.
 ## Layered auth in `index.js`
 
 `githubAuth` and `appAuth` are both factories rather than middleware
-themselves: each takes a "give me an authenticated Octokit" closure and
-returns the actual `(req, res, next)` middleware. Neither
-`src/middleware/github-auth.js` nor `src/middleware/app-auth.js` requires
-`src/lib/client.js` / `src/lib/app-client.js` directly - `index.js` is the
-only place that does, and it's what injects `lazyCreateOctokit` /
-`getInstallationOctokit` into them. This is the same pattern in both
-places: the middleware knows *how* to attach an Octokit client to the
-request, `index.js` decides *which* one.
+themselves: each takes closures for the actual work and returns the
+actual `(req, res, next)` middleware. Neither `src/middleware/github-auth.js`
+nor `src/middleware/app-auth.js` requires `src/lib/client.js` /
+`src/lib/app-client.js` directly - `index.js` is the only place that
+does, and it's what injects `lazyCreateOctokit` (for `/github`) and
+`resolveInstallationOctokit` (for `/app`, see "Multi-tenant `/app`" above)
+into them. This is the same pattern in both places: the middleware knows
+*how* to attach an Octokit client to the request, `index.js` decides
+*which* one. `appAuth` additionally takes a target resolver
+(`forOrg`/`forRepo`) since, unlike `githubAuth`, what it needs to resolve
+depends on which specific route matched - see the comments in
+`app-auth.js` and `index.js` for why that means it's applied per route
+rather than as one router-wide `.use()`.
 
 `githubRouter`, `appRouter`, and `loginRouter` are all built with
 `NewEmptyRouter()` from `simple-router-builder` — a thin wrapper around
@@ -452,6 +489,8 @@ POST /github/repos/user/my-app-a82f91cd/branches/from
 Every `/app` request needs `Authorization: Bearer <token>`, where `token`
 is either a Google-signed identity token for a `TRUSTED_GCP_INVOKER_EMAILS`
 entry, or `APP_ACCESS_SECRET` - see "Calling this from automation" above.
+Which installation acts on the request is resolved from the `:org` or
+`:owner`/`:repo` in the path - see "Multi-tenant `/app`" above.
 
 ## Routes (mounted under `/setup` — see "Bootstrapping a GitHub App" above)
 
@@ -459,7 +498,7 @@ entry, or `APP_ACCESS_SECRET` - see "Calling this from automation" above.
 | --- | --- | --- | --- |
 | GET | `/` | `?org=<org-login>` | Start the manifest flow for `org` |
 | GET | `/callback` | `?code=...` (from GitHub's redirect) | Exchange the code for the new App's credentials (shown once) |
-| GET | `/installations` | — | List this App's installations, to find `GITHUB_APP_INSTALLATION_ID` |
+| GET | `/installations` | — | List this App's current installations (informational only) |
 
 ## Routes (mounted under `/login` — see "Self-serve login" above)
 
@@ -477,10 +516,12 @@ entry, or `APP_ACCESS_SECRET` - see "Calling this from automation" above.
   project doesn't depend on `express` at all. `req.body`/`req.query`/`res.json`/`res.redirect`/`res.locals`
   still work because `@google-cloud/functions-framework` supplies them via its
   own internal Express app before `Main` is ever invoked.
-- Octokit clients for `/github` are cached per Bearer token in a
-  module-scope `Map` (`octokits` in `index.js`); the `/app` Octokit and
-  `/login`'s app slug lookup are each a single cached instance/value. All
-  live only as long as the warm container does.
+- Octokit clients are cached per Bearer token for `/github` (module-scope
+  `Map` `octokits` in `index.js`), and per resolved installation id for
+  `/app` (`installationOctokits`, alongside a separate `installationIdByTarget`
+  cache for the org/repo -> installation id lookup itself - see
+  "Multi-tenant `/app`" above). `/login`'s app slug lookup is a single
+  cached value. All live only as long as the warm container does.
 - `@octokit/rest` is pinned to `^20` and `@octokit/auth-app` to `^6`
   because later major versions are ESM-only and this project uses
   CommonJS (`require`), matching the Cloud Functions entry point convention.
