@@ -89,7 +89,8 @@ npm run dev   # npx @google-cloud/functions-framework --target=Main --port=8080
 
 Then open `http://localhost:8080/docs` for the API reference. No env vars
 are required to run this at all - every route needs only the caller's own
-token, supplied per request.
+token, supplied per request. The one optional exception is `PUBLIC_BASE_URL`
+- see "API reference" below for what it's for.
 
 ## Routes (mounted under `/github`)
 
@@ -153,6 +154,20 @@ tag plus Scalar's CDN loader script, no build step or npm dependency.
 `GET /docs/openapi.json` serves the raw document (`openapi.json` at the
 repo root) for any other tool that wants to consume it directly (Postman,
 Insomnia, codegen, etc.).
+
+If you're deploying to Cloud Functions gen1, set `PUBLIC_BASE_URL` to this
+function's actual public URL (e.g.
+`https://us-central1-<project>.cloudfunctions.net/<function-name>`) so
+that `/docs`' "Send Request" testing feature works. Without it, the
+document's server URL is relative (`..`), which is correct per the OpenAPI
+spec but gets resolved by Scalar against the `/docs` page URL rather than
+the fetched document's own URL - on gen1, where the function name is a
+required path segment this code never sees in `req.url`, that mismatch is
+enough to drop the function name and send test requests to the bare
+origin, which 404s before reaching this code at all (surfaced as GCP's own
+"Page not found", not anything from this service). This doesn't affect
+local dev or gen2/Cloud Run, which don't have that path-prefix quirk -
+`PUBLIC_BASE_URL` is genuinely optional there.
 
 ## Health check
 
