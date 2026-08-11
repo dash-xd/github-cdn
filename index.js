@@ -55,11 +55,17 @@ const docsRouter = NewEmptyRouter()
     .get("/", serveDocsPage)
     .get("/openapi.json", serveOpenApiDocument)
 
+// `url` is included as a diagnostic: on Cloud Functions gen1, the
+// function-name path segment (e.g. "github-cdn-router") never reaches
+// req.url - Google's routing strips it before invoking this code. Hitting
+// this endpoint on a real deployment and checking whether `url` includes
+// that segment or not is the definitive way to confirm that for your own
+// deployment, rather than taking it on faith.
 function rootHandler(req, res) {
     if (req.method === "GET") {
         res.statusCode = 200;
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ status: "ok" }));
+        res.end(JSON.stringify({ status: "ok", url: req.url }));
         return;
     }
     res.statusCode = 404;
