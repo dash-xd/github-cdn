@@ -2,7 +2,14 @@
 
 const openApiDocument = require("../../openapi.json");
 
-const DOCS_PAGE = `<!doctype html>
+// String.raw, not a plain template literal: this string embeds a client-
+// side <script> containing regex literals with backslash-escaped slashes
+// (\/\/). A plain template literal processes \/ as an escape sequence and
+// silently drops the backslash - since \/ isn't a real JS escape - which
+// corrupted the served script (:\/\//i became :///i, turning the rest of
+// the line into a comment). String.raw serves the source exactly as
+// written, so those backslashes reach the browser intact.
+const DOCS_PAGE = String.raw`<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
