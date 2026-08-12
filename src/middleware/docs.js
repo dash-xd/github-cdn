@@ -82,11 +82,16 @@ function serveOpenApiDocument(req, res) {
         ? { ...openApiDocument, servers: [{ url: publicBaseUrl, description: "Function root" }] }
         : openApiDocument;
 
+    // Prevents a stale cached copy (browser or intermediary) from serving
+    // an outdated spec/servers[0].url after a redeploy - this response is
+    // cheap to regenerate and correctness here matters more than caching it.
+    res.setHeader("Cache-Control", "no-store");
     res.json(doc);
 }
 
 function serveDocsPage(req, res) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
     res.end(DOCS_PAGE);
 }
 
