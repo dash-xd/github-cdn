@@ -234,17 +234,55 @@ async function deleteFiles(octokit, owner, repo, branch, paths) {
 
 // A truly empty branch: an orphan commit with no tree entries and no parents.
 async function createEmptyBranch(octokit, owner, repo, branch) {
-    const emptyTree = await octokit.rest.git.createTree({
+    // GitHub rejects createTree({ tree: [] }). Build a valid empty tree by
+    // starting from the default branch's tree and deleting every leaf entry.
+    const defaultBranch = await getDefaultBranch(octokit, owner, repo);
+    const baseRef = await octokit.rest.git.getRef({
         owner,
         repo,
-        tree: []
+        ref: `heads/${defaultBranch}`
     });
+
+    const baseCommit = await octokit.rest.git.getCommit({
+        owner,
+        repo,
+        commit_sha: baseRef.data.object.sha
+    });
+
+    const baseTree = await octokit.rest.git.getTree({
+        owner,
+        repo,
+        tree_sha: baseCommit.data.tree.sha,
+        recursive: "true"
+    });
+
+    const deletions = baseTree.data.tree
+        .filter((entry) => entry.type !== "tree")
+        .map((entry) => ({
+            path: entry.path,
+            mode: entry.mode,
+            type: entry.type,
+            sha: null
+        }));
+
+    let treeSha = baseCommit.data.tree.sha;
+
+    if (deletions.length > 0) {
+        const emptyTree = await octokit.rest.git.createTree({
+            owner,
+            repo,
+            base_tree: baseCommit.data.tree.sha,
+            tree: deletions
+        });
+
+        treeSha = emptyTree.data.sha;
+    }
 
     const commit = await octokit.rest.git.createCommit({
         owner,
         repo,
         message: "initialize empty branch",
-        tree: emptyTree.data.sha,
+        tree: treeSha,
         parents: []
     });
 

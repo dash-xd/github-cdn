@@ -109,7 +109,15 @@ function parseUpload(req, res, next) {
         next();
     });
 
-    req.pipe(busboy);
+    // The Google Functions Framework buffers request bodies before invoking
+    // the function and exposes the original bytes as req.rawBody. In that
+    // environment req is already drained, so piping it into Busboy produces
+    // "Unexpected end of form". Keep the stream fallback for plain Node/Express.
+    if (Buffer.isBuffer(req.rawBody)) {
+        busboy.end(req.rawBody);
+    } else {
+        req.pipe(busboy);
+    }
 }
 
 module.exports = {
