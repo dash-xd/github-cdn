@@ -2,6 +2,8 @@
 
 const { randomUUID } = require("node:crypto");
 
+const EMPTY_BRANCH_MARKER = ".github-cdn-empty-tree";
+
 function sanitizeName(name) {
     const cleaned = String(name)
         .trim()
@@ -95,11 +97,28 @@ async function commitFiles(octokit, owner, repo, branch, files) {
         });
     }
 
+    const parentTree = await octokit.rest.git.getTree({
+        owner,
+        repo,
+        tree_sha: parentCommit.data.tree.sha
+    });
+
+    const treeEntries = [...blobs];
+
+    if (parentTree.data.tree.some((entry) => entry.path === EMPTY_BRANCH_MARKER)) {
+        treeEntries.push({
+            path: EMPTY_BRANCH_MARKER,
+            mode: "100644",
+            type: "blob",
+            sha: null
+        });
+    }
+
     const tree = await octokit.rest.git.createTree({
         owner,
         repo,
         base_tree: parentCommit.data.tree.sha,
-        tree: blobs
+        tree: treeEntries
     });
 
     const commit = await octokit.rest.git.createCommit({
@@ -153,7 +172,9 @@ async function getBranchSnapshot(octokit, owner, repo, branch, { includeContent 
         recursive: "true"
     });
 
-    const entries = tree.data.tree.filter((entry) => entry.type === "blob");
+    const entries = tree.data.tree.filter(
+        (entry) => entry.type === "blob" && entry.path !== EMPTY_BRANCH_MARKER
+    );
 
     if (!includeContent) {
         return entries;
@@ -232,33 +253,18 @@ async function deleteFiles(octokit, owner, repo, branch, paths) {
     return { repo, branch, commit: commit.data.sha };
 }
 
-// A truly empty branch: an orphan commit with no tree entries and no parents.
+// GitHub's Trees API does not create a zero-entry tree. Represent a logically
+// empty branch with a reserved marker that snapshots hide and the first upload
+// removes.
 async function createEmptyBranch(octokit, owner, repo, branch) {
-    // GitHub rejects createTree({ tree: [] }). Create a temporary root entry,
-    // then delete that exact entry from its tree to obtain the canonical
-    // empty tree without depending on the repository's existing layout.
-    const markerPath = ".github-cdn-empty-tree";
-
-    const stagingTree = await octokit.rest.git.createTree({
+    const tree = await octokit.rest.git.createTree({
         owner,
         repo,
         tree: [{
-            path: markerPath,
+            path: EMPTY_BRANCH_MARKER,
             mode: "100644",
             type: "blob",
-            content: "temporary"
-        }]
-    });
-
-    const emptyTree = await octokit.rest.git.createTree({
-        owner,
-        repo,
-        base_tree: stagingTree.data.sha,
-        tree: [{
-            path: markerPath,
-            mode: "100644",
-            type: "blob",
-            sha: null
+            content: ""
         }]
     });
 
@@ -266,7 +272,7 @@ async function createEmptyBranch(octokit, owner, repo, branch) {
         owner,
         repo,
         message: "initialize empty branch",
-        tree: emptyTree.data.sha,
+        tree: tree.data.sha,
         parents: []
     });
 
