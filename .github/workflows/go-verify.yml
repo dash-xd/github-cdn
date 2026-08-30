@@ -26,6 +26,24 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      - name: Patch optimistic concurrency retry path
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('ghservice/service.go')
+          text = path.read_text()
+          text = text.replace('''\t\thead, err := s.head(ctx, owner, repo, branch)\n\t\tif err != nil {\n\t\t\treturn "", err\n\t\t}\n\t\tchanges := map[string]any{}\n''', '''\t\thead, err := s.head(ctx, owner, repo, branch)\n\t\tif err != nil {\n\t\t\tlast = err\n\t\t\tif !isOptimisticConflict(err) || attempt == maxMutationAttempts {\n\t\t\t\treturn "", err\n\t\t\t}\n\t\t\tif err := waitMutationRetry(ctx, attempt); err != nil {\n\t\t\t\treturn "", err\n\t\t\t}\n\t\t\tcontinue\n\t\t}\n\t\tchanges := map[string]any{}\n''', 1)
+          old = '''\t\tlast = err\n\t\tif !isStale(err) || attempt == maxMutationAttempts {\n\t\t\treturn "", err\n\t\t}\n\t\tceiling := min(maxRetryDelay, time.Duration(1<<(attempt-1))*time.Millisecond)\n\t\tjitter := time.Duration(mrand.Int64N(int64(ceiling) + 1))\n\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\treturn "", ctx.Err()\n\t\tcase <-time.After(jitter):\n\t\t}\n\t}\n\treturn "", last\n}\n\nfunc isStale(err error) bool {\n\tvar gqlErr *api.GraphQLError\n\tif errors.As(err, &gqlErr) {\n\t\tfor _, item := range gqlErr.Errors {\n\t\t\tif item.Type == "STALE_DATA" || strings.Contains(strings.ToLower(item.Message), "expected branch to point") {\n\t\t\t\treturn true\n\t\t\t}\n\t\t}\n\t}\n\treturn false\n}\n'''
+          new = '''\t\tlast = err\n\t\tif !isOptimisticConflict(err) || attempt == maxMutationAttempts {\n\t\t\treturn "", err\n\t\t}\n\t\tif err := waitMutationRetry(ctx, attempt); err != nil {\n\t\t\treturn "", err\n\t\t}\n\t}\n\treturn "", last\n}\n\nfunc waitMutationRetry(ctx context.Context, attempt int) error {\n\tceiling := min(maxRetryDelay, time.Duration(1<<(attempt-1))*time.Millisecond)\n\tjitter := time.Duration(mrand.Int64N(int64(ceiling) + 1))\n\tselect {\n\tcase <-ctx.Done():\n\t\treturn ctx.Err()\n\tcase <-time.After(jitter):\n\t\treturn nil\n\t}\n}\n\nfunc isOptimisticConflict(err error) bool {\n\tif err == nil {\n\t\treturn false\n\t}\n\tvar httpErr *api.HTTPError\n\tif errors.As(err, &httpErr) {\n\t\tswitch httpErr.StatusCode {\n\t\tcase http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:\n\t\t\treturn true\n\t\t}\n\t}\n\tvar gqlErr *api.GraphQLError\n\tif errors.As(err, &gqlErr) {\n\t\tfor _, item := range gqlErr.Errors {\n\t\t\tif item.Type == "STALE_DATA" || staleMutationMessage(item.Message) {\n\t\t\t\treturn true\n\t\t\t}\n\t\t}\n\t}\n\treturn staleMutationMessage(err.Error())\n}\n\nfunc staleMutationMessage(message string) bool {\n\tmessage = strings.ToLower(message)\n\treturn strings.Contains(message, "expected branch to point") ||\n\t\t(strings.Contains(message, " is at ") && strings.Contains(message, " but expected ")) ||\n\t\tstrings.Contains(message, "branch not found")\n}\n'''
+          if old not in text:
+              raise SystemExit('expected retry block not found')
+          path.write_text(text.replace(old, new, 1))
+          Path('ghservice/service_test.go').write_text('''package ghservice\n\nimport (\n\t"errors"\n\t"testing"\n)\n\nfunc TestOptimisticConflictMessages(t *testing.T) {\n\ttests := []struct { name string; err error; want bool }{\n\t\t{"actual stale head wording", errors.New("GraphQL: is at 6b1940b but expected 68d1163 (createCommitOnBranch)"), true},\n\t\t{"transient branch resolution", errors.New("GraphQL: Branch not found (createCommitOnBranch)"), true},\n\t\t{"legacy stale wording", errors.New("expected branch to point at another oid"), true},\n\t\t{"ordinary error", errors.New("GraphQL: repository not found"), false},\n\t}\n\tfor _, tt := range tests { t.Run(tt.name, func(t *testing.T) { if got := isOptimisticConflict(tt.err); got != tt.want { t.Fatalf("isOptimisticConflict() = %v, want %v", got, tt.want) } }) }\n}\n''')
+          PY
+          gofmt -w ghservice/service.go ghservice/service_test.go
+
       - name: Normalize module metadata
         shell: bash
         run: go mod tidy
@@ -34,15 +52,12 @@ jobs:
         shell: bash
         run: go test ./...
 
-      - name: Persist normalized module metadata
+      - name: Persist tested fix
         shell: bash
         run: |
           set -euo pipefail
-          if git diff --quiet -- go.mod go.sum; then
-            exit 0
-          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add go.mod go.sum
-          git commit -m 'Normalize Go module metadata'
+          git add ghservice/service.go ghservice/service_test.go go.mod go.sum
+          git commit -m 'Retry GitHub branch mutation conflicts'
           git push origin HEAD:codex/go-gh-token-cdn
