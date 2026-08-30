@@ -3,7 +3,8 @@
 const { randomUUID } = require("node:crypto");
 
 const EMPTY_BRANCH_MARKER = ".github-cdn-empty-tree";
-const MAX_REF_UPDATE_ATTEMPTS = 5;
+const MAX_REF_UPDATE_ATTEMPTS = 12;
+const MAX_REF_RETRY_DELAY_MS = 100;
 
 function sanitizeName(name) {
     const cleaned = String(name)
@@ -16,6 +17,16 @@ function sanitizeName(name) {
 
 function isRefConflict(err) {
     return err?.status === 409 || err?.status === 422;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function backoffRefConflict(attempt) {
+    const ceiling = Math.min(MAX_REF_RETRY_DELAY_MS, 2 ** (attempt - 1));
+    const delay = Math.floor(Math.random() * (ceiling + 1));
+    await sleep(delay);
 }
 
 async function createRepo(octokit, name, options = {}) {
@@ -89,6 +100,7 @@ async function updateBranchOptimistically(octokit, owner, repo, branch, buildCom
                 throw err;
             }
             lastConflict = err;
+            await backoffRefConflict(attempt);
         }
     }
 
