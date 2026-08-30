@@ -192,6 +192,12 @@ async function getBranchSnapshot(octokit, owner, repo, branch, { includeContent 
         recursive: "true"
     });
 
+    if (tree.data.truncated) {
+        const err = new Error("branch tree exceeds GitHub's recursive tree response limit");
+        err.status = 413;
+        throw err;
+    }
+
     const entries = tree.data.tree.filter(
         (entry) => entry.type === "blob" && entry.path !== EMPTY_BRANCH_MARKER
     );
@@ -225,8 +231,7 @@ async function deleteFiles(octokit, owner, repo, branch, paths) {
         throw new Error("no paths to delete");
     }
 
-    const toDelete = new Set(paths);
-    let deletedCount = 0;
+    const uniquePaths = [...new Set(paths)];
 
     const commitSha = await updateBranchOptimistically(
         octokit,
@@ -234,51 +239,30 @@ async function deleteFiles(octokit, owner, repo, branch, paths) {
         repo,
         branch,
         async ({ commitSha: parentSha, treeSha }) => {
-            const tree = await octokit.rest.git.getTree({
+            const deletions = uniquePaths.map((path) => ({
+                path,
+                mode: "100644",
+                type: "blob",
+                sha: null
+            }));
+
+            const newTree = await octokit.rest.git.createTree({
                 owner,
                 repo,
-                tree_sha: treeSha,
-                recursive: "true"
+                base_tree: treeSha,
+                tree: deletions
             });
 
-            const snapshot = tree.data.tree.filter(
-                (entry) => entry.type === "blob" && entry.path !== EMPTY_BRANCH_MARKER
-            );
-            const remaining = snapshot
-                .filter((entry) => !toDelete.has(entry.path))
-                .map((entry) => ({
-                    path: entry.path,
-                    mode: entry.mode,
-                    type: "blob",
-                    sha: entry.sha
-                }));
-
-            deletedCount = snapshot.length - remaining.length;
-            if (deletedCount === 0) {
+            if (newTree.data.sha === treeSha) {
                 const err = new Error("none of the given paths exist on this branch");
                 err.status = 404;
                 throw err;
             }
 
-            if (remaining.length === 0) {
-                remaining.push({
-                    path: EMPTY_BRANCH_MARKER,
-                    mode: "100644",
-                    type: "blob",
-                    content: ""
-                });
-            }
-
-            const newTree = await octokit.rest.git.createTree({
-                owner,
-                repo,
-                tree: remaining
-            });
-
             const commit = await octokit.rest.git.createCommit({
                 owner,
                 repo,
-                message: `delete ${deletedCount} object${deletedCount === 1 ? "" : "s"}`,
+                message: `delete ${uniquePaths.length} object${uniquePaths.length === 1 ? "" : "s"}`,
                 tree: newTree.data.sha,
                 parents: [parentSha]
             });
@@ -287,7 +271,7 @@ async function deleteFiles(octokit, owner, repo, branch, paths) {
         }
     );
 
-    return { repo, branch, commit: commitSha, deleted: deletedCount };
+    return { repo, branch, commit: commitSha, requested: uniquePaths.length };
 }
 
 async function createEmptyBranch(octokit, owner, repo, branch) {
