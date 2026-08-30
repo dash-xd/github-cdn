@@ -42,4 +42,4 @@ jobs:
 
       - name: Compose default.xml and smoke exact sources
         shell: bash
-        run: scripts/repo-smoke.sh "$RUNNER_TEMP/github-cdn-repo"
+        run: bash scripts/repo-smoke.sh "$RUNNER_TEMP/github-cdn-repo"
