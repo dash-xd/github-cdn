@@ -166,7 +166,14 @@ func (s *Service) mutate(ctx context.Context, owner, repo, branch, message strin
 	for attempt := 1; attempt <= maxMutationAttempts; attempt++ {
 		head, err := s.head(ctx, owner, repo, branch)
 		if err != nil {
-			return "", err
+			last = err
+			if !isOptimisticConflict(err) || attempt == maxMutationAttempts {
+				return "", err
+			}
+			if err := waitMutationRetry(ctx, attempt); err != nil {
+				return "", err
+			}
+			continue
 		}
 		changes := map[string]any{}
 		if len(additions) > 0 {
@@ -193,30 +200,54 @@ func (s *Service) mutate(ctx context.Context, owner, repo, branch, message strin
 			return out.CreateCommitOnBranch.Commit.OID, nil
 		}
 		last = err
-		if !isStale(err) || attempt == maxMutationAttempts {
+		if !isOptimisticConflict(err) || attempt == maxMutationAttempts {
 			return "", err
 		}
-		ceiling := min(maxRetryDelay, time.Duration(1<<(attempt-1))*time.Millisecond)
-		jitter := time.Duration(mrand.Int64N(int64(ceiling) + 1))
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(jitter):
+		if err := waitMutationRetry(ctx, attempt); err != nil {
+			return "", err
 		}
 	}
 	return "", last
 }
 
-func isStale(err error) bool {
+func waitMutationRetry(ctx context.Context, attempt int) error {
+	ceiling := min(maxRetryDelay, time.Duration(1<<(attempt-1))*time.Millisecond)
+	jitter := time.Duration(mrand.Int64N(int64(ceiling) + 1))
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(jitter):
+		return nil
+	}
+}
+
+func isOptimisticConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
+			return true
+		}
+	}
 	var gqlErr *api.GraphQLError
 	if errors.As(err, &gqlErr) {
 		for _, item := range gqlErr.Errors {
-			if item.Type == "STALE_DATA" || strings.Contains(strings.ToLower(item.Message), "expected branch to point") {
+			if item.Type == "STALE_DATA" || staleMutationMessage(item.Message) {
 				return true
 			}
 		}
 	}
-	return false
+	return staleMutationMessage(err.Error())
+}
+
+func staleMutationMessage(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "expected branch to point") ||
+		(strings.Contains(message, " is at ") && strings.Contains(message, " but expected ")) ||
+		strings.Contains(message, "branch not found")
 }
 
 func (s *Service) Snapshot(ctx context.Context, owner, repo, branch string, includeContent bool) ([]SnapshotEntry, error) {
