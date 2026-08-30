@@ -37,7 +37,7 @@ jobs:
         working-directory: terraform
         run: |
           set -euo pipefail
-          terraform fmt -check -recursive
+          terraform fmt -check -diff -recursive
           terraform init -backend=false
           terraform validate
 
