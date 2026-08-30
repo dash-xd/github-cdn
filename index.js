@@ -17,25 +17,23 @@ const {
 const { createOrgRepoHandler } = require("./src/middleware/org-repos.js");
 const { serveOpenApiDocument, serveDocsPage } = require("./src/middleware/docs.js");
 
-// Keep caller credentials request-scoped. Caching Octokit by raw bearer token
-// retains credentials for the lifetime of a warm function instance and grows
-// without bound as distinct callers or refreshed tokens arrive.
+// Keep caller GitHub credentials request-scoped. Authorization is deliberately
+// not consumed here: on IAM-protected Cloud Run / Cloud Functions deployments,
+// that header belongs to Google's ID-token authentication layer.
 function createRequestOctokit(token) {
     return createOctokit(token);
 }
 
-// Every route runs as whatever the caller's own token can do - personal
-// or org, scoped however the token is scoped. There's no server-held
-// GitHub credential anywhere in this deployment: the caller brings a
-// token, it's forwarded straight through to Octokit, and that's the
-// entire trust model - this function itself has nothing to authorize or
-// protect beyond what GitHub already enforces for that token.
+// GitHub credentials always arrive independently in X-GH-Device-Access-Token.
+// This keeps the application auth contract identical in both deployment modes:
 //
-// createOrgRepoHandler sits alongside createRepoHandler for that same
-// reason: org-owned repo creation isn't a separate privilege tier, it's
-// just a different GitHub endpoint (POST /orgs/{org}/repos vs
-// POST /user/repos) - any caller token with org repo-creation rights can
-// use it exactly like any other route here.
+//   public/locally reachable:  X-GH-Device-Access-Token only
+//   Google IAM protected:      Authorization: Bearer <Google ID token>
+//                              X-GH-Device-Access-Token: <GitHub token>
+//
+// Google IAM, when enabled, rejects the request before this function executes.
+// The application therefore does not need to parse, validate, or switch on the
+// Google bearer token; it only authenticates the caller to GitHub.
 const githubRouter = NewEmptyRouter()
     .use(githubAuth(createRequestOctokit))
     .post("/repos/:name", createRepoHandler)
