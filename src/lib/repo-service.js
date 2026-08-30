@@ -3,6 +3,7 @@
 const { randomUUID } = require("node:crypto");
 
 const EMPTY_BRANCH_MARKER = ".github-cdn-empty-tree";
+const MAX_REF_UPDATE_ATTEMPTS = 5;
 
 function sanitizeName(name) {
     const cleaned = String(name)
@@ -11,6 +12,10 @@ function sanitizeName(name) {
         .replace(/^-+|-+$/g, "");
 
     return cleaned || "repo";
+}
+
+function isRefConflict(err) {
+    return err?.status === 409 || err?.status === 422;
 }
 
 async function createRepo(octokit, name, options = {}) {
@@ -30,10 +35,6 @@ async function getDefaultBranch(octokit, owner, repo) {
     return data.default_branch;
 }
 
-// Like createRepo, but org-owned: a personal access token creates under
-// the token owner's account (POST /user/repos), which has no equivalent
-// for "create this under an org I belong to" - that has to go through
-// POST /orgs/{org}/repos instead, with the org named explicitly.
 async function createOrgRepo(octokit, org, name, options = {}) {
     const repoName = `${sanitizeName(name)}-${randomUUID().slice(0, 8)}`;
 
@@ -47,10 +48,53 @@ async function createOrgRepo(octokit, org, name, options = {}) {
     return data;
 }
 
-// Writes each uploaded file to its content-addressed path (see
-// middleware/upload.js#objectPath) in a single commit. Storage identity
-// comes from the content hash, not the caller-supplied filename, so
-// re-uploading the same bytes is idempotent: same hash, same path.
+async function getBranchHead(octokit, owner, repo, branch) {
+    const ref = await octokit.rest.git.getRef({
+        owner,
+        repo,
+        ref: `heads/${branch}`
+    });
+
+    const commit = await octokit.rest.git.getCommit({
+        owner,
+        repo,
+        commit_sha: ref.data.object.sha
+    });
+
+    return {
+        commitSha: ref.data.object.sha,
+        treeSha: commit.data.tree.sha
+    };
+}
+
+async function updateBranchOptimistically(octokit, owner, repo, branch, buildCommit) {
+    let lastConflict;
+
+    for (let attempt = 1; attempt <= MAX_REF_UPDATE_ATTEMPTS; attempt += 1) {
+        const head = await getBranchHead(octokit, owner, repo, branch);
+        const commitSha = await buildCommit(head);
+
+        try {
+            await octokit.rest.git.updateRef({
+                owner,
+                repo,
+                ref: `heads/${branch}`,
+                sha: commitSha,
+                force: false
+            });
+
+            return commitSha;
+        } catch (err) {
+            if (!isRefConflict(err) || attempt === MAX_REF_UPDATE_ATTEMPTS) {
+                throw err;
+            }
+            lastConflict = err;
+        }
+    }
+
+    throw lastConflict || new Error("failed to update branch ref");
+}
+
 async function commitFiles(octokit, owner, repo, branch, files) {
     if (!files || files.length === 0) {
         throw new Error("no files to upload");
@@ -58,21 +102,6 @@ async function commitFiles(octokit, owner, repo, branch, files) {
 
     const targetBranch = branch || (await getDefaultBranch(octokit, owner, repo));
 
-    const ref = await octokit.rest.git.getRef({
-        owner,
-        repo,
-        ref: `heads/${targetBranch}`
-    });
-
-    // `base_tree` must be a tree SHA, not the commit SHA the ref points at.
-    const parentCommit = await octokit.rest.git.getCommit({
-        owner,
-        repo,
-        commit_sha: ref.data.object.sha
-    });
-
-    // Several uploaded files can hash to the same object; write each
-    // distinct one once, but still report every requested file below.
     const uniqueObjects = new Map();
     for (const file of files) {
         if (!uniqueObjects.has(file.objectId)) {
@@ -97,49 +126,52 @@ async function commitFiles(octokit, owner, repo, branch, files) {
         });
     }
 
-    const parentTree = await octokit.rest.git.getTree({
+    const commitSha = await updateBranchOptimistically(
+        octokit,
         owner,
         repo,
-        tree_sha: parentCommit.data.tree.sha
-    });
+        targetBranch,
+        async ({ commitSha: parentSha, treeSha }) => {
+            const parentTree = await octokit.rest.git.getTree({
+                owner,
+                repo,
+                tree_sha: treeSha
+            });
 
-    const treeEntries = [...blobs];
+            const treeEntries = [...blobs];
 
-    if (parentTree.data.tree.some((entry) => entry.path === EMPTY_BRANCH_MARKER)) {
-        treeEntries.push({
-            path: EMPTY_BRANCH_MARKER,
-            mode: "100644",
-            type: "blob",
-            sha: null
-        });
-    }
+            if (parentTree.data.tree.some((entry) => entry.path === EMPTY_BRANCH_MARKER)) {
+                treeEntries.push({
+                    path: EMPTY_BRANCH_MARKER,
+                    mode: "100644",
+                    type: "blob",
+                    sha: null
+                });
+            }
 
-    const tree = await octokit.rest.git.createTree({
-        owner,
-        repo,
-        base_tree: parentCommit.data.tree.sha,
-        tree: treeEntries
-    });
+            const tree = await octokit.rest.git.createTree({
+                owner,
+                repo,
+                base_tree: treeSha,
+                tree: treeEntries
+            });
 
-    const commit = await octokit.rest.git.createCommit({
-        owner,
-        repo,
-        message: `store ${uniqueObjects.size} object${uniqueObjects.size === 1 ? "" : "s"}`,
-        tree: tree.data.sha,
-        parents: [ref.data.object.sha]
-    });
+            const commit = await octokit.rest.git.createCommit({
+                owner,
+                repo,
+                message: `store ${uniqueObjects.size} object${uniqueObjects.size === 1 ? "" : "s"}`,
+                tree: tree.data.sha,
+                parents: [parentSha]
+            });
 
-    await octokit.rest.git.updateRef({
-        owner,
-        repo,
-        ref: `heads/${targetBranch}`,
-        sha: commit.data.sha
-    });
+            return commit.data.sha;
+        }
+    );
 
     return {
         repo,
         branch: targetBranch,
-        commit: commit.data.sha,
+        commit: commitSha,
         objects: files.map((file) => ({
             objectId: file.objectId,
             path: file.path,
@@ -150,25 +182,13 @@ async function commitFiles(octokit, owner, repo, branch, files) {
     };
 }
 
-// Snapshot a branch's file tree via the Git Data API instead of `git clone`.
-// Pass includeContent to also fetch each blob's base64 content.
 async function getBranchSnapshot(octokit, owner, repo, branch, { includeContent = false } = {}) {
-    const ref = await octokit.rest.git.getRef({
-        owner,
-        repo,
-        ref: `heads/${branch}`
-    });
-
-    const commit = await octokit.rest.git.getCommit({
-        owner,
-        repo,
-        commit_sha: ref.data.object.sha
-    });
+    const { treeSha } = await getBranchHead(octokit, owner, repo, branch);
 
     const tree = await octokit.rest.git.getTree({
         owner,
         repo,
-        tree_sha: commit.data.tree.sha,
+        tree_sha: treeSha,
         recursive: "true"
     });
 
@@ -206,56 +226,70 @@ async function deleteFiles(octokit, owner, repo, branch, paths) {
     }
 
     const toDelete = new Set(paths);
+    let deletedCount = 0;
 
-    // Only keep blob entries: passing full slash-separated paths (no base_tree)
-    // lets the Git Data API rebuild intermediate directory trees for us.
-    const snapshot = await getBranchSnapshot(octokit, owner, repo, branch);
-    const remaining = snapshot
-        .filter((entry) => !toDelete.has(entry.path))
-        .map((entry) => ({
-            path: entry.path,
-            mode: entry.mode,
-            type: "blob",
-            sha: entry.sha
-        }));
-
-    if (remaining.length === snapshot.length) {
-        throw new Error("none of the given paths exist on this branch");
-    }
-
-    const ref = await octokit.rest.git.getRef({
+    const commitSha = await updateBranchOptimistically(
+        octokit,
         owner,
         repo,
-        ref: `heads/${branch}`
-    });
+        branch,
+        async ({ commitSha: parentSha, treeSha }) => {
+            const tree = await octokit.rest.git.getTree({
+                owner,
+                repo,
+                tree_sha: treeSha,
+                recursive: "true"
+            });
 
-    const newTree = await octokit.rest.git.createTree({
-        owner,
-        repo,
-        tree: remaining
-    });
+            const snapshot = tree.data.tree.filter(
+                (entry) => entry.type === "blob" && entry.path !== EMPTY_BRANCH_MARKER
+            );
+            const remaining = snapshot
+                .filter((entry) => !toDelete.has(entry.path))
+                .map((entry) => ({
+                    path: entry.path,
+                    mode: entry.mode,
+                    type: "blob",
+                    sha: entry.sha
+                }));
 
-    const commit = await octokit.rest.git.createCommit({
-        owner,
-        repo,
-        message: `delete ${paths.length} object${paths.length === 1 ? "" : "s"}`,
-        tree: newTree.data.sha,
-        parents: [ref.data.object.sha]
-    });
+            deletedCount = snapshot.length - remaining.length;
+            if (deletedCount === 0) {
+                const err = new Error("none of the given paths exist on this branch");
+                err.status = 404;
+                throw err;
+            }
 
-    await octokit.rest.git.updateRef({
-        owner,
-        repo,
-        ref: `heads/${branch}`,
-        sha: commit.data.sha
-    });
+            if (remaining.length === 0) {
+                remaining.push({
+                    path: EMPTY_BRANCH_MARKER,
+                    mode: "100644",
+                    type: "blob",
+                    content: ""
+                });
+            }
 
-    return { repo, branch, commit: commit.data.sha };
+            const newTree = await octokit.rest.git.createTree({
+                owner,
+                repo,
+                tree: remaining
+            });
+
+            const commit = await octokit.rest.git.createCommit({
+                owner,
+                repo,
+                message: `delete ${deletedCount} object${deletedCount === 1 ? "" : "s"}`,
+                tree: newTree.data.sha,
+                parents: [parentSha]
+            });
+
+            return commit.data.sha;
+        }
+    );
+
+    return { repo, branch, commit: commitSha, deleted: deletedCount };
 }
 
-// GitHub's Trees API does not create a zero-entry tree. Represent a logically
-// empty branch with a reserved marker that snapshots hide and the first upload
-// removes.
 async function createEmptyBranch(octokit, owner, repo, branch) {
     const tree = await octokit.rest.git.createTree({
         owner,
