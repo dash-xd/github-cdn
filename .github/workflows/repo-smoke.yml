@@ -1,0 +1,45 @@
+name: Repo composition smoke
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - default.xml
+      - scripts/repo-smoke.sh
+      - scripts/smoke-local.sh
+      - .github/workflows/repo-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repo-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout manifest surface
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Install lightweight Android repo launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.local/bin/repo"
+          chmod +x "$HOME/.local/bin/repo"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Compose default.xml and smoke exact sources
+        shell: bash
+        run: scripts/repo-smoke.sh "$RUNNER_TEMP/github-cdn-repo"
