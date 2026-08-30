@@ -9,11 +9,12 @@
   },
   "scripts": {
     "start": "npx --yes @google-cloud/functions-framework --target=Main",
-    "dev": "npx --yes @google-cloud/functions-framework --target=Main --port=8080"
+    "dev": "npx --yes @google-cloud/functions-framework --target=Main --port=8080",
+    "test": "node --test"
   },
   "dependencies": {
     "@octokit/rest": "^20.1.2",
     "busboy": "^1.6.0",
-    "simple-router-builder": "github:dash-xd/simple-router-builder#main"
+    "simple-router-builder": "github:dash-xd/simple-router-builder#2d950a5d475c36ab8cd7d433a8be570e88c1760f"
   }
 }
