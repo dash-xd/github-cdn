@@ -1,203 +1,178 @@
 # github-cdn
 
 Treats GitHub as a content store: an HTTP Cloud Function that creates repos,
-uploads files, snapshots branches, deletes files, and manages branches
-through the GitHub Git Data API via Octokit — no local `git clone` involved.
+uploads files, snapshots branches, deletes files, and manages branches through
+the GitHub Git Data API via Octokit — no local `git clone` involved.
 
-This branch is the stateless, token-only version: the caller always brings
-their own GitHub token and whatever repo/org data the request needs. There
-is no GitHub App, no installation auth, no server-held credential, and no
-shared secret of any kind - this function holds nothing on your behalf. If
-you're looking for GitHub App-based automation (no caller token, the
-function acts as an installed App on the caller's behalf), that's a
-different branch; it doesn't exist here by design.
+This branch is the stateless, token-only version. The caller always brings its
+own GitHub token; the service stores no GitHub credential and has no GitHub App
+installation identity of its own.
+
+## Authentication model
+
+There are two independent authentication layers and they intentionally use
+different headers.
+
+### GitHub authentication
+
+The GitHub credential is always supplied as:
+
+```http
+X-GH-Device-Access-Token: <github token>
+```
+
+`github-cdn` consumes only that header when constructing its request-scoped
+Octokit client. It does not interpret `Authorization` as a GitHub credential.
+
+This fixed application-level contract avoids a collision with deployment
+platform authentication and keeps the same GitHub behavior in every runtime.
+
+### Google IAM authentication
+
+When the function is deployed with Google IAM invocation required, Google uses:
+
+```http
+Authorization: Bearer <google id token>
+```
+
+That token is validated by Cloud Run / Cloud Functions before the request
+reaches `github-cdn`. The application does not parse or validate the Google
+token itself.
+
+This produces two deployment modes without changing application code:
+
+```text
+GitHub-only invocation
+  X-GH-Device-Access-Token: <github token>
+
+Google-IAM + GitHub invocation
+  Authorization: Bearer <google id token>
+  X-GH-Device-Access-Token: <github token>
+```
+
+The deployment pipeline should choose whether the service allows
+unauthenticated platform invocation. In an IAM-protected deployment, grant
+`roles/run.invoker` only to the intended caller identity. In a GitHub-only
+deployment, the endpoint may be reachable without Google IAM and GitHub remains
+the application authorization boundary.
+
+Do not overload `Authorization` with the GitHub token. A private Gen2 function
+needs that header for Google's ID token, and treating it as a GitHub token would
+make the two auth layers mutually exclusive.
 
 ## Layout
 
-```
-index.js                       Cloud Function entry point: builds the router and exports Main
-openapi.json                   OpenAPI 3.2.0 document describing every route
+```text
+index.js                       Cloud Function entry point and router
+openapi.json                   OpenAPI document
 src/
   lib/
-    client.js                  createOctokit(token) -> Octokit instance
-    repo-service.js            GitHub Git Data API service layer (createRepo, createOrgRepo, commitFiles, getBranchSnapshot, deleteFiles, createEmptyBranch, createBranchFrom)
+    client.js                  createOctokit(token)
+    repo-service.js            GitHub Git Data API service layer
   middleware/
-    github-auth.js             githubAuth(createOctokit): returns a middleware that builds res.locals.octokit from the request's Bearer token
-    upload.js                  parseUpload: busboy multipart parser + SHA-256 content addressing; writes res.locals.files, plus objectPath()
-    github-repos.js            one middleware function per route (createRepoHandler, uploadObjectsHandler, ...) plus handleError
-    org-repos.js                createOrgRepoHandler: org-scoped repo creation
-    docs.js                    serveDocsPage / serveOpenApiDocument for /docs
+    github-auth.js             reads X-GH-Device-Access-Token
+    upload.js                  multipart parser + SHA-256 addressing
+    github-repos.js            repository/object/branch handlers
+    org-repos.js               org-scoped repository creation
+    docs.js                    /docs and /docs/openapi.json
+
+test/
+  github-auth.test.js          auth-layer separation tests
+  repo-service.test.js         Git data behavior tests
 ```
-
-There's no `routes/` directory: index.js imports the middleware functions
-above and wires up the router itself, rather than importing a pre-built
-router module.
-
-## Authentication
-
-One way, no exceptions: the caller supplies their own GitHub token as
-`Authorization: Bearer <token>`, and it's forwarded straight through to
-Octokit. Whoever holds the token is authorized for whatever that token can
-do - personal or org, including org-owned repo creation, if the token is
-scoped for it. This function never stores, generates, or checks anything
-of its own; there is nothing to configure to make it "work" beyond
-deploying it. If a request's token doesn't have the rights GitHub requires
-for what it's asking to do, GitHub's own API rejects it - this service
-adds no authorization logic on top of that.
-
-`githubAuth` (`src/middleware/github-auth.js`) is a factory rather than
-middleware itself: it takes a "give me an authenticated Octokit" closure
-and returns the actual `(req, res, next)` middleware. It doesn't require
-`src/lib/client.js` directly - `index.js` is the only place that does, and
-it's what injects `lazyCreateOctokit` (a per-token cache, so the same
-caller's Octokit instance is reused across requests rather than rebuilt
-each time - see `octokits` in `index.js`).
 
 ## Object model
 
-Uploads are content-addressed, not path-addressed:
+Uploads are content-addressed rather than caller-path-addressed:
 
-```
+```text
 upload -> raw content -> SHA-256 -> immutable object -> Git-backed object store
 ```
 
-`parseUpload` (`src/middleware/upload.js`) hashes each uploaded file's bytes
-and stores it at `objects/<hash prefix>/<hash>` via `commitFiles`
-(`src/lib/repo-service.js`). The upload path doesn't know or care whether
-the object will later be read back as a secret, a config file, a build
-artifact, or a plain user upload — storage identity comes from content, not
-from the caller-supplied filename. `originalName` and `contentType` are
-carried along as informational metadata only; they never affect where the
-object is written. One consequence: re-uploading identical bytes is
-idempotent (same hash, same path, no path-traversal surface to sanitize),
-and uploading the same content twice in one request only writes one blob.
+`parseUpload` hashes each uploaded file and stores it at
+`objects/<hash prefix>/<hash>`. The original filename and content type are
+informational metadata only and never determine the object path. Re-uploading
+identical bytes is therefore naturally idempotent.
 
-This mirrors Git's own split between objects (immutable content) and refs
-(human/application meaning) — layering something like `refs/secrets/prod.json
--> { "productionDatabase": "<objectId>" }` on top, with its own
-authorization/decryption rules, is a read-side concern for later and isn't
-part of this router.
+## Run locally
 
-## Run
-
-The Cloud Functions runtime is not installed as a dependency; it's fetched on demand via `npx`.
-
-```
+```bash
 npm install
-npm run dev   # npx @google-cloud/functions-framework --target=Main --port=8080
+npm run dev
 ```
 
-Then open `http://localhost:8080/docs` for the API reference. No env vars
-are required to run this at all - every route needs only the caller's own
-token, supplied per request. The one optional exception is `PUBLIC_BASE_URL`
-- see "API reference" below for what it's for.
+Then use the GitHub token header directly:
 
-## Routes (mounted under `/github`)
-
-| Method | Path | Body / Query | Description |
-| --- | --- | --- | --- |
-| POST | `/repos/:name` | `{ private?: boolean }` | Create a repo named `<name>-<random8>` under the caller's own account |
-| POST | `/repos/:org/:name` | `{ private?: boolean }` | Create a repo named `<name>-<random8>` inside org `:org` (requires a token with org repo-creation rights) |
-| POST | `/repos/:owner/:repo/upload` | multipart form: one or more files, optional `branch` field | Store uploaded files as content-addressed objects, returns each object's id/path/metadata |
-| GET | `/repos/:owner/:repo/:branch` | `?content=true` to include base64 file content | Snapshot a branch's file tree without cloning |
-| DELETE | `/repos/:owner/:repo/:branch` | `{ paths: string[] }` or `{ objectIds: string[] }` (singular `path`/`objectId` also accepted) | Delete one or more objects in a single commit, by tree path or by object id |
-| POST | `/repos/:owner/:repo/branches` | `{ branch: string }` | Create a new empty (orphan) branch |
-| POST | `/repos/:owner/:repo/branches/from` | `{ branch: string, source: string }` | Create a new branch from an existing branch |
-
-### Examples
-
+```bash
+curl \
+  -H "X-GH-Device-Access-Token: $GITHUB_TOKEN" \
+  -F "file=@example.tar.gz" \
+  -F "branch=main" \
+  http://localhost:8080/github/repos/user/repo/upload
 ```
-POST /github/repos/my-app
-Authorization: Bearer ghp_xxx
--> { "name": "my-app-a82f91cd", "owner": "...", "url": "...", "default_branch": "main" }
 
-POST /github/repos/my-org/my-app
-Authorization: Bearer ghp_xxx
--> { "name": "my-app-a82f91cd", "owner": "my-org", "url": "...", "default_branch": "main" }
+No Google bearer token is needed locally unless the local endpoint itself is
+fronted by something enforcing Google IAM.
 
-curl -H "Authorization: Bearer TOKEN" \
-     -F "file=@example.tar.gz" -F "branch=main" \
-     localhost:8080/github/repos/user/my-app-a82f91cd/upload
--> {
-     "repo": "my-app-a82f91cd",
-     "branch": "main",
-     "commit": "...",
-     "objects": [
-       {
-         "objectId": "a3f5c9d8e9f0...",
-         "path": "objects/a3/a3f5c9d8e9f0...",
-         "name": "example.tar.gz",
-         "contentType": "application/gzip",
-         "size": 1048576
-       }
-     ]
-   }
+## Invoke an IAM-protected deployment
 
-GET /github/repos/user/my-app-a82f91cd/main?content=true
+Mint the Google ID token for the service URL using an identity that has
+`roles/run.invoker`, while keeping the GitHub device token separate:
 
-DELETE /github/repos/user/my-app-a82f91cd/main
-{ "objectIds": ["a3f5c9d8e9f0..."] }
+```bash
+GOOGLE_ID_TOKEN="$(
+  gcloud auth print-identity-token \
+    --impersonate-service-account="$INVOKER_SA" \
+    --audiences="$FUNCTION_URL"
+)"
 
-POST /github/repos/user/my-app-a82f91cd/branches
-{ "branch": "empty-branch" }
-
-POST /github/repos/user/my-app-a82f91cd/branches/from
-{ "branch": "feature", "source": "main" }
+curl \
+  -H "Authorization: Bearer $GOOGLE_ID_TOKEN" \
+  -H "X-GH-Device-Access-Token: $GITHUB_TOKEN" \
+  "$FUNCTION_URL/github/repos/user/repo/main"
 ```
+
+For an ephemeral deployment pipeline, the clean lifecycle is:
+
+1. deploy the function with IAM invocation required;
+2. grant an ephemeral or designated test service account `roles/run.invoker`;
+3. use the deployment's temporary GCP credential to impersonate that invoker
+   and mint a short-lived ID token for the function audience;
+4. invoke with the Google ID token in `Authorization` and the GitHub device
+   token in `X-GH-Device-Access-Token`;
+5. destroy the IAM binding/service account together with the test deployment.
+
+This keeps deployer, invoker, runtime, and GitHub identities independent.
+
+## Routes
+
+All GitHub routes are mounted under `/github`.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/repos/:name` | Create a repository under the caller's account |
+| POST | `/repos/:org/:name` | Create a repository in an organization |
+| POST | `/repos/:owner/:repo/upload` | Upload content-addressed objects |
+| GET | `/repos/:owner/:repo/:branch` | Snapshot a branch without cloning |
+| DELETE | `/repos/:owner/:repo/:branch` | Delete objects by tree path or object ID |
+| POST | `/repos/:owner/:repo/branches` | Create an empty branch |
+| POST | `/repos/:owner/:repo/branches/from` | Create a branch from another branch |
 
 ## API reference
 
-`GET /docs` serves an interactive API reference generated from
-`openapi.json`, rendered with [Scalar](https://github.com/scalar/scalar) —
-the whole page is one `<script id="api-reference" data-url="docs/openapi.json">`
-tag plus Scalar's CDN loader script, no build step or npm dependency.
-`GET /docs/openapi.json` serves the raw document (`openapi.json` at the
-repo root) for any other tool that wants to consume it directly (Postman,
-Insomnia, codegen, etc.).
+`GET /docs` serves the interactive API reference and
+`GET /docs/openapi.json` serves the raw document.
 
-If you're deploying to Cloud Functions gen1, set `PUBLIC_BASE_URL` to this
-function's actual public URL (e.g.
-`https://us-central1-<project>.cloudfunctions.net/<function-name>`) so
-that `/docs`' "Send Request" testing feature works. Without it, the
-document's server URL is relative (`..`), which is correct per the OpenAPI
-spec but gets resolved by Scalar against the `/docs` page URL rather than
-the fetched document's own URL - on gen1, where the function name is a
-required path segment this code never sees in `req.url`, that mismatch is
-enough to drop the function name and send test requests to the bare
-origin, which 404s before reaching this code at all (surfaced as GCP's own
-"Page not found", not anything from this service). This doesn't affect
-local dev or gen2/Cloud Run, which don't have that path-prefix quirk -
-`PUBLIC_BASE_URL` is genuinely optional there.
+If deploying to Cloud Functions gen1, `PUBLIC_BASE_URL` can be set to the
+function's actual URL so interactive requests preserve the function-name path
+segment. Gen2 / Cloud Run does not have that path-prefix issue.
 
-## Health check
+## Security invariants
 
-There's no dedicated health router — `GET /healthz` is answered directly by
-the `SimpleRouterBuilder` root handler in `index.js` with `{ "status": "ok" }`.
-Any other request that doesn't match `/github/...` or `/docs` gets a plain
-404 from that same root handler.
-
-## Notes
-
-- `simple-router-builder` isn't published to the npm registry, so `package.json`
-  pulls it directly from source: `"simple-router-builder": "github:dash-xd/simple-router-builder#main"`.
-  `npm install` needs read access to that repo.
-- Routing uses `simple-router-builder`'s `NewEmptyRouter()` — a thin wrapper
-  around the standalone `router` package (the same routing engine Express's
-  own `Router` is built on), not `express.Router()`. This project has no
-  direct dependency on `express` at all. `req.body`/`req.query`/`res.json`/
-  `res.redirect`/`res.locals` still work because `@google-cloud/functions-framework`
-  (run via `npx`) wraps everything in its own Express app before `Main` is
-  ever invoked - it parses the request body itself and attaches the full
-  Express `req`/`res` prototype ahead of time.
-- Data a middleware computes for downstream handlers — the Octokit client,
-  the parsed upload files — lives on `res.locals` (`res.locals.octokit`,
-  `res.locals.files`), not on `req`. `req` stays limited to what the
-  request itself actually carries (`req.params`, `req.query`, `req.body`).
-- Octokit clients are cached per Bearer token in a module-scope `Map`
-  (`octokits` in `index.js`), for the life of the warm container.
-- `@octokit/rest` is pinned to `^20` because later major versions are
-  ESM-only and this project uses CommonJS (`require`), matching the Cloud
-  Functions entry point convention.
-- `openapi.json` uses a couple of genuine OpenAPI 3.2.0 additions where they
-  fit naturally: the top-level `$self` field for document identity, and the
-  new `Tag.summary` field.
+- GitHub tokens are request-scoped and are not cached by raw credential value.
+- `Authorization` is reserved for the deployment platform and ignored by
+  GitHub authentication middleware.
+- `X-GH-Device-Access-Token` is the only application GitHub credential header.
+- Enabling Google IAM is a deployment concern, not an application-mode parser.
+- IAM-protected smoke tests should verify unauthenticated requests fail and the
+  designated invoker succeeds.
