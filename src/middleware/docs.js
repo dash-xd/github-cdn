@@ -2,13 +2,6 @@
 
 const openApiDocument = require("../../openapi.json");
 
-// String.raw, not a plain template literal: this string embeds a client-
-// side <script> containing regex literals with backslash-escaped slashes
-// (\/\/). A plain template literal processes \/ as an escape sequence and
-// silently drops the backslash - since \/ isn't a real JS escape - which
-// corrupted the served script (:\/\//i became :///i, turning the rest of
-// the line into a comment). String.raw serves the source exactly as
-// written, so those backslashes reach the browser intact.
 const DOCS_PAGE = String.raw`<!doctype html>
 <html lang="en">
   <head>
@@ -20,21 +13,6 @@ const DOCS_PAGE = String.raw`<!doctype html>
     <script id="api-reference"></script>
     <script>
       (function () {
-        // The server can't always know its own public URL (see
-        // src/middleware/docs.js and the README): on Cloud Functions
-        // gen1, the function-name path segment is stripped before the
-        // code ever sees req.url, so a server-rendered relative server
-        // URL is a best-effort guess, not a guarantee. The browser has
-        // no such blind spot - window.location is always the real,
-        // complete URL this page was actually loaded at, no matter what
-        // the server could see. So: fetch the spec, and if its server
-        // URL is still relative (PUBLIC_BASE_URL wasn't set server-side),
-        // replace it with one computed from this page's own location
-        // before handing the spec to Scalar. This makes "Send Request"
-        // work correctly with zero configuration, on any deployment
-        // shape (gen1, gen2, local, behind a reverse proxy at any path
-        // depth) - not just ones where an operator remembered to set an
-        // env var.
         function isAbsolute(url) {
           return /^[a-z][a-z0-9+.-]*:\/\//i.test(url);
         }
@@ -62,9 +40,6 @@ const DOCS_PAGE = String.raw`<!doctype html>
             el.setAttribute("data-configuration", JSON.stringify({ spec: { content: spec } }));
           })
           .catch(function () {
-            // Fetching/patching failed for some reason - fall back to
-            // Scalar's own fetch of the (possibly still relative) spec,
-            // rather than showing a blank page.
             el.setAttribute("data-url", "docs/openapi.json");
           })
           .then(loadScalar);
@@ -74,24 +49,42 @@ const DOCS_PAGE = String.raw`<!doctype html>
 </html>
 `;
 
-// The relative server URL in openapi.json ("..", relative to wherever this
-// document is fetched from) is correct per the OpenAPI spec, but not every
-// client resolves it the same way a plain browser navigation would (see
-// the inline script in DOCS_PAGE above for the client-side fix that
-// actually matters here). This override is a secondary, optional escape
-// hatch for deployments that want to force a specific value rather than
-// rely on auto-detection - e.g. a fixed custom domain, or a reverse proxy
-// setup where window.location doesn't match the true public origin.
+function runtimeOpenApiDocument(publicBaseUrl) {
+    const components = openApiDocument.components || {};
+    const securitySchemes = components.securitySchemes || {};
+    const responses = components.responses || {};
+
+    return {
+        ...openApiDocument,
+        ...(publicBaseUrl
+            ? { servers: [{ url: publicBaseUrl, description: "Function root" }] }
+            : {}),
+        components: {
+            ...components,
+            securitySchemes: {
+                ...securitySchemes,
+                githubToken: {
+                    type: "apiKey",
+                    in: "header",
+                    name: "X-GH-Device-Access-Token",
+                    description:
+                        "Caller-supplied GitHub access token. Authorization is reserved for optional Google IAM invocation authentication."
+                }
+            },
+            responses: {
+                ...responses,
+                Unauthorized: {
+                    ...(responses.Unauthorized || {}),
+                    description: "Missing X-GH-Device-Access-Token header."
+                }
+            }
+        }
+    };
+}
+
 function serveOpenApiDocument(req, res) {
-    const publicBaseUrl = process.env.PUBLIC_BASE_URL;
+    const doc = runtimeOpenApiDocument(process.env.PUBLIC_BASE_URL);
 
-    const doc = publicBaseUrl
-        ? { ...openApiDocument, servers: [{ url: publicBaseUrl, description: "Function root" }] }
-        : openApiDocument;
-
-    // Prevents a stale cached copy (browser or intermediary) from serving
-    // an outdated spec/servers[0].url after a redeploy - this response is
-    // cheap to regenerate and correctness here matters more than caching it.
     res.setHeader("Cache-Control", "no-store");
     res.json(doc);
 }
@@ -102,4 +95,4 @@ function serveDocsPage(req, res) {
     res.end(DOCS_PAGE);
 }
 
-module.exports = { serveOpenApiDocument, serveDocsPage };
+module.exports = { runtimeOpenApiDocument, serveOpenApiDocument, serveDocsPage };
