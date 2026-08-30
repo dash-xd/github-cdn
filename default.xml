@@ -2,6 +2,6 @@
 <manifest>
   <remote name="github" fetch="https://github.com/" />
   <default remote="github" sync-j="4" />
-  <project name="dash-xd/github-cdn.git" path="javascript" revision="bd1038934d87338fcb9b3521c659bee8c1b60201" />
-  <project name="dash-xd/github-cdn.git" path="golang" revision="80f4f3e85cd920cac17bd3caeceba2d709a4ece3" />
+  <project name="dash-xd/github-cdn.git" path="javascript" revision="266a9ac95a6dd004342f1573d03ff412b900d855" />
+  <project name="dash-xd/github-cdn.git" path="golang" revision="49fdb48a973865802d77fe1657e1338df5ac79e0" />
 </manifest>
