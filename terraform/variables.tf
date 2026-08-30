@@ -40,16 +40,16 @@ variable "invoker_members" {
 }
 
 variable "max_instance_count" {
-  type        = number
-  default     = 3
+  type    = number
+  default = 3
 }
 
 variable "available_memory" {
-  type        = string
-  default     = "256M"
+  type    = string
+  default = "256M"
 }
 
 variable "timeout_seconds" {
-  type        = number
-  default     = 60
+  type    = number
+  default = 60
 }
