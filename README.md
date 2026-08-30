@@ -10,7 +10,7 @@
 `default.xml` is the composition contract. The repository-owned smoke script initializes Android Repo against this repository, explicitly selects `default.xml`, syncs the exact revisions, and then runs the source checks:
 
 ```bash
-scripts/repo-smoke.sh
+bash scripts/repo-smoke.sh
 ```
 
 Equivalent composition steps are:
@@ -27,6 +27,6 @@ This produces `javascript/` and `golang/` worktrees at the exact revisions above
 
 ## CI boundary
 
-`.github/workflows/repo-smoke.yml` currently provides Node, Go, and the lightweight Android `repo` launcher, then calls `scripts/repo-smoke.sh`. The composition logic deliberately lives in the script rather than the workflow so it can later be invoked from Nix without carrying GitHub Actions coupling into the composition contract.
+`.github/workflows/repo-smoke.yml` currently provides Node, Go, and the lightweight Android `repo` launcher, then calls `bash scripts/repo-smoke.sh`. The composition logic deliberately lives in the script rather than the workflow so it can later be invoked from Nix without carrying GitHub Actions coupling into the composition contract.
 
 Full token-only API qualification remains owned by Huram's ephemeral deployment/test control plane rather than by `main`.
