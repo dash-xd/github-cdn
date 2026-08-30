@@ -1,11 +1,14 @@
-name: Repo composition smoke
+name: Composition kit smoke
 
 on:
   push:
     branches:
+      - candidate/github-cdn-composition
       - main
     paths:
       - default.xml
+      - scripts/compose.sh
+      - terraform/**
       - .github/workflows/repo-smoke.yml
   workflow_dispatch:
 
@@ -13,19 +16,10 @@ permissions:
   contents: read
 
 jobs:
-  repo-smoke:
+  composition:
     runs-on: ubuntu-latest
     steps:
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.x'
-          cache: false
+      - uses: actions/checkout@v4
 
       - name: Install Android repo launcher
         shell: bash
@@ -36,30 +30,33 @@ jobs:
           chmod +x "$HOME/.local/bin/repo"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Compose default.xml
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/github-cdn-repo"
-          cd "$RUNNER_TEMP/github-cdn-repo"
-          repo init \
-            -u https://github.com/dash-xd/github-cdn.git \
-            -b main \
-            -m default.xml
-          repo sync -c --no-tags
+      - uses: hashicorp/setup-terraform@v3
 
-      - name: Test JavaScript implementation
+      - name: Validate Terraform
         shell: bash
-        working-directory: ${{ runner.temp }}/github-cdn-repo/javascript
+        working-directory: terraform
         run: |
           set -euo pipefail
-          npm install --no-audit --no-fund
-          npm test
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
 
-      - name: Test Go implementation
+      - name: Compose JavaScript implementation
         shell: bash
-        working-directory: ${{ runner.temp }}/github-cdn-repo/golang
+        env:
+          GITHUB_CDN_MANIFEST_REVISION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          go mod tidy
-          go test ./...
+          bash scripts/compose.sh javascript "$RUNNER_TEMP/github-cdn-js"
+          jq -e '.implementation == "javascript" and .runtime == "nodejs24"' "$RUNNER_TEMP/github-cdn-js/deployment.json"
+          test -f "$RUNNER_TEMP/github-cdn-js/javascript/package.json"
+
+      - name: Compose Go implementation
+        shell: bash
+        env:
+          GITHUB_CDN_MANIFEST_REVISION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bash scripts/compose.sh golang "$RUNNER_TEMP/github-cdn-go"
+          jq -e '.implementation == "golang" and .runtime == "go126"' "$RUNNER_TEMP/github-cdn-go/deployment.json"
+          test -f "$RUNNER_TEMP/github-cdn-go/golang/go.mod"
