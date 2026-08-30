@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="github" fetch="https://github.com/" />
+  <default remote="github" sync-j="4" />
+  <project name="dash-xd/github-cdn.git" path="javascript" revision="bd1038934d87338fcb9b3521c659bee8c1b60201" />
+  <project name="dash-xd/github-cdn.git" path="golang" revision="80f4f3e85cd920cac17bd3caeceba2d709a4ece3" />
+</manifest>
