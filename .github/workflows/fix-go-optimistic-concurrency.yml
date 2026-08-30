@@ -1,0 +1,156 @@
+name: Patch Go optimistic concurrency retries
+
+on:
+  push:
+    paths:
+      - .github/workflows/fix-go-optimistic-concurrency.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/go-gh-token-cdn
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Harden retry path and add regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('ghservice/service.go')
+          text = path.read_text()
+
+          old = '''\tvar last error
+\tfor attempt := 1; attempt <= maxMutationAttempts; attempt++ {
+\t\thead, err := s.head(ctx, owner, repo, branch)
+\t\tif err != nil {
+\t\t\treturn "", err
+\t\t}
+\t\tchanges := map[string]any{}
+'''
+          new = '''\tvar last error
+\tfor attempt := 1; attempt <= maxMutationAttempts; attempt++ {
+\t\thead, err := s.head(ctx, owner, repo, branch)
+\t\tif err != nil {
+\t\t\tlast = err
+\t\t\tif !isOptimisticConflict(err) || attempt == maxMutationAttempts {
+\t\t\t\treturn "", err
+\t\t\t}
+\t\t\tif err := waitMutationRetry(ctx, attempt); err != nil {
+\t\t\t\treturn "", err
+\t\t\t}
+\t\t\tcontinue
+\t\t}
+\t\tchanges := map[string]any{}
+'''
+          if old not in text:
+              raise SystemExit('mutate head block no longer matches expected source')
+          text = text.replace(old, new, 1)
+
+          old = '''\t\tlast = err
+\t\tif !isStale(err) || attempt == maxMutationAttempts {
+\t\t\treturn "", err
+\t\t}
+\t\tceiling := min(maxRetryDelay, time.Duration(1<<(attempt-1))*time.Millisecond)
+\t\tjitter := time.Duration(mrand.Int64N(int64(ceiling) + 1))
+\t\tselect {
+\t\tcase <-ctx.Done():
+\t\t\treturn "", ctx.Err()
+\t\tcase <-time.After(jitter):
+\t\t}
+\t}
+\treturn "", last
+}
+
+func isStale(err error) bool {
+\tvar gqlErr *api.GraphQLError
+\tif errors.As(err, &gqlErr) {
+\t\tfor _, item := range gqlErr.Errors {
+\t\t\tif item.Type == "STALE_DATA" || strings.Contains(strings.ToLower(item.Message), "expected branch to point") {
+\t\t\t\treturn true
+\t\t\t}
+\t\t}
+\t}
+\treturn false
+}
+'''
+          new = '''\t\tlast = err
+\t\tif !isOptimisticConflict(err) || attempt == maxMutationAttempts {
+\t\t\treturn "", err
+\t\t}
+\t\tif err := waitMutationRetry(ctx, attempt); err != nil {
+\t\t\treturn "", err
+\t\t}
+\t}
+\treturn "", last
+}
+
+func waitMutationRetry(ctx context.Context, attempt int) error {
+\tceiling := min(maxRetryDelay, time.Duration(1<<(attempt-1))*time.Millisecond)
+\tjitter := time.Duration(mrand.Int64N(int64(ceiling) + 1))
+\tselect {
+\tcase <-ctx.Done():
+\t\treturn ctx.Err()
+\tcase <-time.After(jitter):
+\t\treturn nil
+\t}
+}
+
+func isOptimisticConflict(err error) bool {
+\tif err == nil {
+\t\treturn false
+\t}
+\tvar httpErr *api.HTTPError
+\tif errors.As(err, &httpErr) {
+\t\tswitch httpErr.StatusCode {
+\t\tcase http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
+\t\t\treturn true
+\t\t}
+\t}
+\tvar gqlErr *api.GraphQLError
+\tif errors.As(err, &gqlErr) {
+\t\tfor _, item := range gqlErr.Errors {
+\t\t\tif item.Type == "STALE_DATA" || staleMutationMessage(item.Message) {
+\t\t\t\treturn true
+\t\t\t}
+\t\t}
+\t}
+\treturn staleMutationMessage(err.Error())
+}
+
+func staleMutationMessage(message string) bool {
+\tmessage = strings.ToLower(message)
+\treturn strings.Contains(message, "expected branch to point") ||
+\t\t(strings.Contains(message, " is at ") && strings.Contains(message, " but expected ")) ||
+\t\tstrings.Contains(message, "branch not found")
+}
+'''
+          if old not in text:
+              raise SystemExit('retry classifier block no longer matches expected source')
+          path.write_text(text.replace(old, new, 1))
+
+          Path('ghservice/service_test.go').write_text('''package ghservice\n\nimport (\n\t"errors"\n\t"testing"\n)\n\nfunc TestOptimisticConflictMessages(t *testing.T) {\n\ttests := []struct {\n\t\tname string\n\t\terr  error\n\t\twant bool\n\t}{\n\t\t{name: "actual stale head wording", err: errors.New("GraphQL: is at 6b1940b but expected 68d1163 (createCommitOnBranch)"), want: true},\n\t\t{name: "transient branch resolution", err: errors.New("GraphQL: Branch not found (createCommitOnBranch)"), want: true},\n\t\t{name: "legacy stale wording", err: errors.New("expected branch to point at another oid"), want: true},\n\t\t{name: "ordinary error", err: errors.New("GraphQL: repository not found"), want: false},\n\t}\n\tfor _, tt := range tests {\n\t\tt.Run(tt.name, func(t *testing.T) {\n\t\t\tif got := isOptimisticConflict(tt.err); got != tt.want {\n\t\t\t\tt.Fatalf("isOptimisticConflict() = %v, want %v", got, tt.want)\n\t\t\t}\n\t\t})\n\t}\n}\n''')
+          PY
+          gofmt -w ghservice/service.go ghservice/service_test.go
+          go mod tidy
+          git diff --check
+          go test ./...
+      - name: Commit tested fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/fix-go-optimistic-concurrency.yml
+          git add ghservice/service.go ghservice/service_test.go go.mod go.sum
+          git commit -m 'Retry GitHub branch mutation conflicts'
+          git push origin HEAD:codex/go-gh-token-cdn
