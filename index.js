@@ -17,15 +17,11 @@ const {
 const { createOrgRepoHandler } = require("./src/middleware/org-repos.js");
 const { serveOpenApiDocument, serveDocsPage } = require("./src/middleware/docs.js");
 
-const octokits = new Map();
-
-function lazyCreateOctokit(token) {
-    let octokit = octokits.get(token);
-    if (!octokit) {
-        octokit = createOctokit(token);
-        octokits.set(token, octokit);
-    }
-    return octokit;
+// Keep caller credentials request-scoped. Caching Octokit by raw bearer token
+// retains credentials for the lifetime of a warm function instance and grows
+// without bound as distinct callers or refreshed tokens arrive.
+function createRequestOctokit(token) {
+    return createOctokit(token);
 }
 
 // Every route runs as whatever the caller's own token can do - personal
@@ -41,7 +37,7 @@ function lazyCreateOctokit(token) {
 // POST /user/repos) - any caller token with org repo-creation rights can
 // use it exactly like any other route here.
 const githubRouter = NewEmptyRouter()
-    .use(githubAuth(lazyCreateOctokit))
+    .use(githubAuth(createRequestOctokit))
     .post("/repos/:name", createRepoHandler)
     .post("/repos/:org/:name", createOrgRepoHandler)
     .post("/repos/:owner/:repo/upload", parseUpload, uploadObjectsHandler)
