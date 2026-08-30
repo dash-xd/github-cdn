@@ -1,17 +1,18 @@
 # github-cdn
 
-`main` is the durable composition and deployment-kit surface for github-cdn. Runtime implementations live on dedicated source branches; `default.xml` is the sole revision ledger for the currently qualified JavaScript and Go implementations.
+`main` is the durable composition and deployment-kit surface for github-cdn. Runtime implementations live on dedicated source branches; `default.xml` is the sole promoted revision ledger for the JavaScript and Go implementations.
 
-This repository is not a standing deployment. It is intended to be forked/cloned by consumers and imported by Huram while iterating on candidate compositions.
+This repository is not a standing deployment. It is intended to be forked or cloned by consumers and imported by Huram while iterating on candidate compositions.
 
 ## Branch model
 
 - `claude/token-only-github-cdn` — JavaScript token-only implementation.
 - `codex/go-gh-token-cdn` — Go token-only implementation.
-- `main` — qualified `default.xml`, Android Repo composition helper, and generic Terraform deployment kit.
+- `main` — promoted `default.xml`, Android Repo composition helper, generic Terraform deployment kit, and composition-kit validation.
+- `candidate/*` — candidate composition surfaces prior to promotion.
 - `archive/*` — prior promoted `main` generations preserved when a newer qualified composition replaces them.
 
-A runtime implementation should not be copied into `main` merely because it is the current qualification target.
+A runtime implementation should not be copied into `main` merely because it is the current qualification target. Mutable implementation branch heads are development inputs; immutable manifest revisions are promoted outputs.
 
 ## Compose
 
@@ -52,8 +53,12 @@ terraform -chdir=terraform apply \
 
 Invoker IAM is explicit through `invoker_members`; an empty set does not create a public invoker binding.
 
+## Validation boundary
+
+`main` validates the composition kit itself: Terraform formatting/validation and Android Repo materialization of both manifest projects. Runtime unit tests and live IAM/Git behavior belong to the implementation branches and Huram qualification, not to the composition repository's durable branch.
+
 ## Qualification and promotion
 
 Huram owns ephemeral live qualification. It locks an implementation branch to an immutable SHA, composes a disposable qualification repository, deploys with profile-owned infrastructure, runs the live IAM/Git correctness proof, destroys the candidate, and records an exact machine result.
 
-Only a successful exact qualification should produce the next promoted `default.xml`. Before moving that candidate to `main`, preserve the previous `main` as an archive branch. The promoted branch therefore describes what passed, not whatever mutable implementation branch happens to be newest.
+Only a successful exact qualification should advance the corresponding revision in `default.xml`. Before promoting a replacement composition to `main`, preserve the previous `main` as an archive branch. `main` therefore describes promoted evidence, not whatever mutable implementation branch happens to be newest.
