@@ -1,0 +1,62 @@
+name: Composition kit smoke
+
+on:
+  push:
+    branches:
+      - candidate/github-cdn-composition
+      - main
+    paths:
+      - default.xml
+      - scripts/compose.sh
+      - terraform/**
+      - .github/workflows/composition-kit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  composition:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android repo launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.local/bin/repo"
+          chmod +x "$HOME/.local/bin/repo"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Validate Terraform
+        shell: bash
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+
+      - name: Compose JavaScript implementation
+        shell: bash
+        env:
+          GITHUB_CDN_MANIFEST_REVISION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bash scripts/compose.sh javascript "$RUNNER_TEMP/github-cdn-js"
+          jq -e '.implementation == "javascript" and .runtime == "nodejs24"' "$RUNNER_TEMP/github-cdn-js/deployment.json"
+          test -f "$RUNNER_TEMP/github-cdn-js/javascript/package.json"
+
+      - name: Compose Go implementation
+        shell: bash
+        env:
+          GITHUB_CDN_MANIFEST_REVISION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bash scripts/compose.sh golang "$RUNNER_TEMP/github-cdn-go"
+          jq -e '.implementation == "golang" and .runtime == "go126"' "$RUNNER_TEMP/github-cdn-go/deployment.json"
+          test -f "$RUNNER_TEMP/github-cdn-go/golang/go.mod"
