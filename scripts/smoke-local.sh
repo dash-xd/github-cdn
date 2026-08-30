@@ -24,6 +24,7 @@ test "$(git -C "$root/golang" rev-parse HEAD)" = "$go_expected"
 
 (
   cd "$root/golang"
+  go mod tidy
   go test ./...
 )
 
