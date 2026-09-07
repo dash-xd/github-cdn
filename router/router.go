@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -12,24 +11,18 @@ import (
 
 	"github.com/dash-xd/github-cdn/cdn"
 	"github.com/dash-xd/github-cdn/ghservice"
+	"github.com/dash-xd/github-cdn/operations"
 	"github.com/go-chi/chi/v5"
 )
 
-type Service interface {
-	CreateRepo(context.Context, string, string, bool) (ghservice.Repo, error)
-	CommitObjects(context.Context, string, string, string, []cdn.Object) (ghservice.CommitResult, error)
-	Snapshot(context.Context, string, string, string, bool) ([]ghservice.SnapshotEntry, error)
-	Delete(context.Context, string, string, string, []string) (ghservice.CommitResult, error)
-	CreateEmptyBranch(context.Context, string, string, string) (ghservice.CommitResult, error)
-	CreateBranchFrom(context.Context, string, string, string, string) (ghservice.CommitResult, error)
-}
+type Service = operations.Service
 
 type Factory func(token string) (Service, error)
 
 type serviceKey struct{}
 
 func New() http.Handler {
-	return NewWithFactory(func(token string) (Service, error) { return ghservice.New(token) })
+	return NewWithFactory(operations.New)
 }
 
 func NewWithFactory(factory Factory) http.Handler {
@@ -92,7 +85,9 @@ func createRepo(org bool) http.HandlerFunc {
 		if org {
 			owner = chi.URLParam(r, "org")
 		}
-		res, err := svc(r).CreateRepo(r.Context(), owner, chi.URLParam(r, "name"), private)
+		res, err := operations.CreateRepo(r.Context(), svc(r), operations.CreateRepoRequest{
+			Owner: owner, Name: chi.URLParam(r, "name"), Private: private,
+		})
 		if err != nil {
 			writeError(w, err)
 			return
@@ -131,11 +126,9 @@ func upload(w http.ResponseWriter, r *http.Request) {
 			objects = append(objects, cdn.NewObject(header.Filename, header.Header.Get("Content-Type"), content))
 		}
 	}
-	if len(objects) == 0 {
-		writeJSON(w, 400, map[string]string{"error": "no files uploaded"})
-		return
-	}
-	res, err := svc(r).CommitObjects(r.Context(), chi.URLParam(r, "owner"), chi.URLParam(r, "repo"), branch, objects)
+	res, err := operations.Upload(r.Context(), svc(r), operations.UploadRequest{
+		Owner: chi.URLParam(r, "owner"), Repo: chi.URLParam(r, "repo"), Branch: branch, Objects: objects,
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -145,7 +138,9 @@ func upload(w http.ResponseWriter, r *http.Request) {
 
 func snapshot(w http.ResponseWriter, r *http.Request) {
 	content, _ := strconv.ParseBool(r.URL.Query().Get("content"))
-	res, err := svc(r).Snapshot(r.Context(), chi.URLParam(r, "owner"), chi.URLParam(r, "repo"), chi.URLParam(r, "*"), content)
+	res, err := operations.Snapshot(r.Context(), svc(r), operations.SnapshotRequest{
+		Owner: chi.URLParam(r, "owner"), Repo: chi.URLParam(r, "repo"), Branch: chi.URLParam(r, "*"), IncludeContent: content,
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -172,19 +167,9 @@ func deleteObjects(w http.ResponseWriter, r *http.Request) {
 	if body.ObjectID != "" {
 		ids = append(ids, body.ObjectID)
 	}
-	for _, id := range ids {
-		if p := cdn.ObjectPath(id); p != "" {
-			paths = append(paths, p)
-		} else {
-			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("invalid objectId %q", id)})
-			return
-		}
-	}
-	if len(paths) == 0 {
-		writeJSON(w, 400, map[string]string{"error": "provide path(s) or objectId(s)"})
-		return
-	}
-	res, err := svc(r).Delete(r.Context(), chi.URLParam(r, "owner"), chi.URLParam(r, "repo"), chi.URLParam(r, "*"), paths)
+	res, err := operations.Delete(r.Context(), svc(r), operations.DeleteRequest{
+		Owner: chi.URLParam(r, "owner"), Repo: chi.URLParam(r, "repo"), Branch: chi.URLParam(r, "*"), Paths: paths, ObjectIDs: ids,
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -196,11 +181,13 @@ func emptyBranch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Branch string `json:"branch"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Branch == "" {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "branch is required"})
 		return
 	}
-	res, err := svc(r).CreateEmptyBranch(r.Context(), chi.URLParam(r, "owner"), chi.URLParam(r, "repo"), body.Branch)
+	res, err := operations.CreateEmptyBranch(r.Context(), svc(r), operations.CreateEmptyBranchRequest{
+		Owner: chi.URLParam(r, "owner"), Repo: chi.URLParam(r, "repo"), Branch: body.Branch,
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -213,11 +200,13 @@ func branchFrom(w http.ResponseWriter, r *http.Request) {
 		Branch string `json:"branch"`
 		Source string `json:"source"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Branch == "" || body.Source == "" {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "branch and source are required"})
 		return
 	}
-	res, err := svc(r).CreateBranchFrom(r.Context(), chi.URLParam(r, "owner"), chi.URLParam(r, "repo"), body.Branch, body.Source)
+	res, err := operations.CreateBranchFrom(r.Context(), svc(r), operations.CreateBranchFromRequest{
+		Owner: chi.URLParam(r, "owner"), Repo: chi.URLParam(r, "repo"), Branch: body.Branch, Source: body.Source,
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -226,6 +215,11 @@ func branchFrom(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeError(w http.ResponseWriter, err error) {
+	var invalid *operations.InvalidArgumentError
+	if errors.As(err, &invalid) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	status := ghservice.HTTPStatus(err)
 	var se *ghservice.StatusError
 	if errors.As(err, &se) {

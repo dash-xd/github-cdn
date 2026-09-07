@@ -1,0 +1,57 @@
+name: Verify github-cdn operations tool
+
+on:
+  push:
+    branches:
+      - codex/smoke-operations-tool
+      - router/go
+    paths:
+      - '**/*.go'
+      - go.mod
+      - go.sum
+      - .github/workflows/smoke-tool-verify.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Vet and test transport split
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test ./...
+
+      - name: Verify Smoke-compatible Go tool resolution
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          cd "$tools"
+          GOWORK=off go mod init smoke.local/github-cdn-tools
+          GOPROXY=direct GONOSUMDB=github.com/dash-xd/github-cdn GOWORK=off \
+            go get -tool "github.com/dash-xd/github-cdn/cmd/github-cdn@$CANDIDATE_SHA"
+          grep -F 'github.com/dash-xd/github-cdn/cmd/github-cdn' go.mod
+
+          set +e
+          output="$(GOWORK=off go tool github-cdn repo-create smoke-tool-probe 2>&1)"
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -F 'GH_TOKEN or GITHUB_TOKEN is required' <<<"$output"
