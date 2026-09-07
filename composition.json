@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "kind": "github-cdn.git-composition",
+  "repository": "dash-xd/github-cdn",
+  "components": {
+    "javascript-router": {
+      "repository": "dash-xd/github-cdn",
+      "ref": "router/javascript",
+      "commit": "266a9ac95a6dd004342f1573d03ff412b900d855",
+      "workspace_path": "javascript",
+      "runtime": "nodejs24",
+      "entry_point": "Main"
+    },
+    "go-router": {
+      "repository": "dash-xd/github-cdn",
+      "ref": "router/go",
+      "commit": "49fdb48a973865802d77fe1657e1338df5ac79e0",
+      "workspace_path": "golang",
+      "runtime": "go126",
+      "entry_point": "Main"
+    }
+  }
+}

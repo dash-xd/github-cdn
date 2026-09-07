@@ -5,7 +5,9 @@ on:
     branches:
       - candidate/github-cdn-composition
       - main
+      - codex/git-composition-role-refs
     paths:
+      - composition.json
       - default.xml
       - scripts/compose.sh
       - terraform/**
@@ -20,6 +22,61 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate Git composition manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          import xml.etree.ElementTree as ET
+
+          with open('composition.json', encoding='utf-8') as f:
+              composition = json.load(f)
+
+          assert composition.get('schema') == 1
+          assert composition.get('kind') == 'github-cdn.git-composition'
+          assert composition.get('repository') == 'dash-xd/github-cdn'
+
+          components = composition.get('components')
+          assert isinstance(components, dict)
+          assert set(components) == {'javascript-router', 'go-router'}
+
+          expected = {
+              'javascript-router': {
+                  'ref': 'router/javascript',
+                  'workspace_path': 'javascript',
+                  'runtime': 'nodejs24',
+                  'entry_point': 'Main',
+              },
+              'go-router': {
+                  'ref': 'router/go',
+                  'workspace_path': 'golang',
+                  'runtime': 'go126',
+                  'entry_point': 'Main',
+              },
+          }
+
+          by_path = {}
+          for name, rules in expected.items():
+              component = components[name]
+              assert component.get('repository') == 'dash-xd/github-cdn'
+              for key, value in rules.items():
+                  assert component.get(key) == value, (name, key, component.get(key), value)
+              commit = component.get('commit', '')
+              assert re.fullmatch(r'[0-9a-f]{40}', commit), (name, commit)
+              by_path[component['workspace_path']] = commit
+
+          tree = ET.parse('default.xml')
+          projects = tree.getroot().findall('project')
+          repo_manifest = {
+              project.attrib['path']: project.attrib['revision']
+              for project in projects
+              if project.attrib.get('name') == 'dash-xd/github-cdn.git'
+          }
+          assert repo_manifest == by_path, (repo_manifest, by_path)
+          PY
 
       - name: Install Android repo launcher
         shell: bash

@@ -10,10 +10,12 @@ case "$implementation" in
   javascript)
     runtime=nodejs24
     entry_point=Main
+    role_ref=router/javascript
     ;;
   golang)
     runtime=go126
     entry_point=Main
+    role_ref=router/go
     ;;
   *)
     echo "usage: $0 [javascript|golang] [workspace]" >&2
@@ -30,16 +32,23 @@ workspace="$(cd "$workspace" && pwd)"
   repo sync -c --no-tags "$implementation"
 )
 
+source_dir="$workspace/$implementation"
+commit="$(git -C "$source_dir" rev-parse HEAD)"
+[[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+
 cat >"$workspace/deployment.json" <<EOF
 {
   "implementation": "$implementation",
-  "source_dir": "$workspace/$implementation",
+  "source_dir": "$source_dir",
   "runtime": "$runtime",
   "entry_point": "$entry_point",
+  "role_ref": "$role_ref",
+  "commit": "$commit",
   "manifest_url": "$manifest_url",
   "manifest_revision": "$manifest_revision"
 }
 EOF
 
-printf 'composed %s at %s\n' "$implementation" "$workspace/$implementation"
-printf 'terraform: -var=source_dir=%q -var=runtime=%q -var=entry_point=%q\n' "$workspace/$implementation" "$runtime" "$entry_point"
+printf 'composed %s at %s\n' "$implementation" "$source_dir"
+printf 'component: %s @ %s\n' "$role_ref" "$commit"
+printf 'terraform: -var=source_dir=%q -var=runtime=%q -var=entry_point=%q\n' "$source_dir" "$runtime" "$entry_point"
