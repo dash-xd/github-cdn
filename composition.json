@@ -5,7 +5,8 @@
   "components": {
     "javascript-router": {
       "repository": "dash-xd/github-cdn",
-      "ref": "router/javascript",
+      "ref": "js",
+      "capabilities": ["js/router"],
       "commit": "266a9ac95a6dd004342f1573d03ff412b900d855",
       "workspace_path": "javascript",
       "runtime": "nodejs24",
@@ -13,7 +14,8 @@
     },
     "go-router": {
       "repository": "dash-xd/github-cdn",
-      "ref": "router/go",
+      "ref": "go",
+      "capabilities": ["go/router"],
       "commit": "49fdb48a973865802d77fe1657e1338df5ac79e0",
       "workspace_path": "golang",
       "runtime": "go126",
