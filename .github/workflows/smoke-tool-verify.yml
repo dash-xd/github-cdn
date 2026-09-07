@@ -1,6 +1,7 @@
 name: Verify github-cdn operations tool
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - codex/smoke-operations-tool
