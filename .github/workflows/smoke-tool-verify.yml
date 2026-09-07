@@ -1,11 +1,10 @@
-name: Verify github-cdn operations tool
+name: Verify github-cdn Go implementation
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - codex/smoke-operations-tool
-      - router/go
+      - go
     paths:
       - '**/*.go'
       - go.mod
@@ -29,14 +28,14 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Vet and test transport split
+      - name: Vet and test Go implementation
         shell: bash
         run: |
           set -euo pipefail
           go vet ./...
           go test ./...
 
-      - name: Verify Smoke-compatible Go tool resolution
+      - name: Verify root Go tool resolution
         shell: bash
         env:
           CANDIDATE_SHA: ${{ github.sha }}
@@ -47,8 +46,8 @@ jobs:
           cd "$tools"
           GOWORK=off go mod init smoke.local/github-cdn-tools
           GOPROXY=direct GONOSUMDB=github.com/dash-xd/github-cdn GOWORK=off \
-            go get -tool "github.com/dash-xd/github-cdn/cmd/github-cdn@$CANDIDATE_SHA"
-          grep -F 'github.com/dash-xd/github-cdn/cmd/github-cdn' go.mod
+            go get -tool "github.com/dash-xd/github-cdn@$CANDIDATE_SHA"
+          grep -F 'github.com/dash-xd/github-cdn' go.mod
 
           set +e
           output="$(GOWORK=off go tool github-cdn repo-create smoke-tool-probe 2>&1)"
@@ -56,3 +55,15 @@ jobs:
           set -e
           test "$status" -ne 0
           grep -F 'GH_TOKEN or GITHUB_TOKEN is required' <<<"$output"
+
+      - name: Verify movable go branch selector
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/tools-go-ref"
+          mkdir -p "$tools"
+          cd "$tools"
+          GOWORK=off go mod init smoke.local/github-cdn-go-ref
+          GOPROXY=direct GONOSUMDB=github.com/dash-xd/github-cdn GOWORK=off \
+            go get -tool 'github.com/dash-xd/github-cdn@go'
+          grep -F 'github.com/dash-xd/github-cdn' go.mod
