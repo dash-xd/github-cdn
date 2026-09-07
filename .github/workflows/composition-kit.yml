@@ -6,6 +6,7 @@ on:
       - candidate/github-cdn-composition
       - main
       - codex/git-composition-role-refs
+      - codex/language-implementation-refs
     paths:
       - composition.json
       - default.xml
@@ -45,13 +46,15 @@ jobs:
 
           expected = {
               'javascript-router': {
-                  'ref': 'router/javascript',
+                  'ref': 'js',
+                  'capabilities': ['js/router'],
                   'workspace_path': 'javascript',
                   'runtime': 'nodejs24',
                   'entry_point': 'Main',
               },
               'go-router': {
-                  'ref': 'router/go',
+                  'ref': 'go',
+                  'capabilities': ['go/router'],
                   'workspace_path': 'golang',
                   'runtime': 'go126',
                   'entry_point': 'Main',
@@ -105,7 +108,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/compose.sh javascript "$RUNNER_TEMP/github-cdn-js"
-          jq -e '.implementation == "javascript" and .runtime == "nodejs24"' "$RUNNER_TEMP/github-cdn-js/deployment.json"
+          jq -e '.implementation == "javascript" and .runtime == "nodejs24" and .implementation_ref == "js" and .capabilities == ["js/router"]' "$RUNNER_TEMP/github-cdn-js/deployment.json"
           test -f "$RUNNER_TEMP/github-cdn-js/javascript/package.json"
 
       - name: Compose Go implementation
@@ -115,5 +118,5 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/compose.sh golang "$RUNNER_TEMP/github-cdn-go"
-          jq -e '.implementation == "golang" and .runtime == "go126"' "$RUNNER_TEMP/github-cdn-go/deployment.json"
+          jq -e '.implementation == "golang" and .runtime == "go126" and .implementation_ref == "go" and .capabilities == ["go/router"]' "$RUNNER_TEMP/github-cdn-go/deployment.json"
           test -f "$RUNNER_TEMP/github-cdn-go/golang/go.mod"

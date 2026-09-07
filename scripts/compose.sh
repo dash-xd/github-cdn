@@ -10,12 +10,14 @@ case "$implementation" in
   javascript)
     runtime=nodejs24
     entry_point=Main
-    role_ref=router/javascript
+    implementation_ref=js
+    capabilities='["js/router"]'
     ;;
   golang)
     runtime=go126
     entry_point=Main
-    role_ref=router/go
+    implementation_ref=go
+    capabilities='["go/router"]'
     ;;
   *)
     echo "usage: $0 [javascript|golang] [workspace]" >&2
@@ -42,7 +44,8 @@ cat >"$workspace/deployment.json" <<EOF
   "source_dir": "$source_dir",
   "runtime": "$runtime",
   "entry_point": "$entry_point",
-  "role_ref": "$role_ref",
+  "implementation_ref": "$implementation_ref",
+  "capabilities": $capabilities,
   "commit": "$commit",
   "manifest_url": "$manifest_url",
   "manifest_revision": "$manifest_revision"
@@ -50,5 +53,5 @@ cat >"$workspace/deployment.json" <<EOF
 EOF
 
 printf 'composed %s at %s\n' "$implementation" "$source_dir"
-printf 'component: %s @ %s\n' "$role_ref" "$commit"
+printf 'component: %s @ %s\n' "$implementation_ref" "$commit"
 printf 'terraform: -var=source_dir=%q -var=runtime=%q -var=entry_point=%q\n' "$source_dir" "$runtime" "$entry_point"
